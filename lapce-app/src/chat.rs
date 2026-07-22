@@ -10,6 +10,7 @@ use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith};
 use floem::views::editor::command::CommandExecuted;
 use lapce_core::buffer::diff::{DiffLines, rope_diff};
 use lapce_core::command::EditCommand;
+use lapce_core::cursor::Cursor;
 use lapce_core::mode::Mode;
 use lapce_core::syntax::Syntax;
 use lapce_rpc::proxy::ProxyNotification;
@@ -433,6 +434,21 @@ pub fn extract_file_path(
     None
 }
 
+/// True for read tools, which crow-cli reports with `kind:"read"` (or a title
+/// beginning with `read`). Their file body comes back as a text content block,
+/// but the chat renders only a clickable path link for them — never the body —
+/// so callers must NOT feed that text into an inline terminal (doing so would
+/// attach a terminal grid and override the link-only view with the full file).
+/// Mirrors the `is_read` check in `chat_view::render_tool_call`.
+pub fn is_read_tool(kind: Option<&str>, title: Option<&str>) -> bool {
+    if kind == Some("read") {
+        return true;
+    }
+    title
+        .map(|t| t.to_lowercase().starts_with("read"))
+        .unwrap_or(false)
+}
+
 impl ChatData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         Self::new_with_id(cx, editors, common, ChatId::next())
@@ -686,8 +702,13 @@ impl ChatData {
         // Instant feedback, exactly like the reference store: show the user
         // message immediately, before any round-trip.
         self.push_block(self.user_block(text.clone()));
-        // Clear the input editor.
+        // Clear the input editor. `reload` empties the buffer but leaves the
+        // editor's cursor at the old end-of-text offset; if we don't reset it,
+        // the next keystroke inserts at that stale offset into the now-empty
+        // buffer and `Buffer::mk_new_rev` panics ("self must cover all
+        // 0-regions of other"). Reset to the origin (insert mode, offset 0).
         self.input_editor.doc().reload(Rope::from(""), true);
+        self.input_editor.cursor().set(Cursor::origin(false));
         self.is_loading.set(true);
 
         if let Some(session_id) = self.session_id.get_untracked() {
@@ -870,8 +891,14 @@ impl ChatData {
                 }
                 // Text-content path (crow-cli execute): feed the ANSI output
                 // into a per-tool grid and render it as an inline terminal.
+                // READ tools also return their file body as a text content
+                // block, but those render as a clickable link only — feeding
+                // them would attach a terminal and dump the whole file, so
+                // skip them here.
                 if let Some(text) = content_text {
-                    self.feed_tool_output_text(&id, &text);
+                    if !is_read_tool(kind, title) {
+                        self.feed_tool_output_text(&id, &text);
+                    }
                 }
                 // Diff path (crow-cli edit/write): render a diff view.
                 if let Some(diff) = diff {
@@ -1061,6 +1088,64 @@ impl ChatData {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The chat-input crash root cause: `Doc::reload(Rope::from(""), true)`
+    /// empties the buffer but leaves the editor's cursor at the old
+    /// end-of-text offset. Inserting at that stale offset into the now-empty
+    /// buffer panics in `Buffer::mk_new_rev` with
+    /// "self must cover all 0-regions of other". This documents the hazard.
+    #[test]
+    #[should_panic(expected = "self must cover all 0-regions of other")]
+    fn input_reload_with_stale_cursor_panics() {
+        use lapce_core::buffer::Buffer;
+        use lapce_core::editor::EditType;
+        use lapce_core::selection::Selection;
+
+        let mut b = Buffer::new("");
+        b.edit(
+            &[(Selection::caret(0), "hello world")],
+            EditType::InsertChars,
+        );
+        // Send → clear, but the cursor is left at offset 11 (end of old text).
+        b.reload(Rope::from(""), true);
+        // Typing at the stale offset 11 into the empty buffer → panic.
+        b.edit(&[(Selection::caret(11), "x")], EditType::InsertChars);
+    }
+
+    /// The fix: `send_prompt` resets the cursor to the origin after clearing,
+    /// so the next keystroke inserts at offset 0 and the buffer stays
+    /// consistent.
+    #[test]
+    fn input_reload_then_reset_cursor_insert_works() {
+        use lapce_core::buffer::Buffer;
+        use lapce_core::editor::EditType;
+        use lapce_core::selection::Selection;
+
+        let mut b = Buffer::new("");
+        b.edit(
+            &[(Selection::caret(0), "hello world")],
+            EditType::InsertChars,
+        );
+        b.reload(Rope::from(""), true);
+        // Cursor reset to origin (offset 0), as send_prompt now does.
+        b.edit(&[(Selection::caret(0), "x")], EditType::InsertChars);
+        assert_eq!(b.to_string(), "x");
+    }
+
+    #[test]
+    fn is_read_tool_detection() {
+        // kind:"read" is authoritative.
+        assert!(is_read_tool(Some("read"), None));
+        assert!(is_read_tool(Some("read"), Some("anything")));
+        // Title prefix fallback (crow-cli titles like "read: foo.rs").
+        assert!(is_read_tool(None, Some("read: src/main.rs")));
+        assert!(is_read_tool(None, Some("Read foo")));
+        // Non-read tools must NOT match.
+        assert!(!is_read_tool(Some("execute"), Some("execute")));
+        assert!(!is_read_tool(Some("edit"), Some("edit: foo.rs")));
+        assert!(!is_read_tool(None, Some("write: foo.rs")));
+        assert!(!is_read_tool(None, None));
+    }
 
     /// The exact shape crow-cli sends when an `execute` tool spawns a
     /// terminal: a `tool_call_update` with `status:"in_progress"` and a

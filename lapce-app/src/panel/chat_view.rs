@@ -14,7 +14,9 @@ use floem::{
     style::CursorStyle,
     text::Style as FontStyle,
     views::{
-        Decorators, container, dyn_stack, empty, label, rich_text, scroll, stack,
+        Decorators, container, dyn_stack,
+        editor::{WrapProp, text::WrapMethod},
+        empty, label, rich_text, scroll, stack,
     },
 };
 
@@ -273,7 +275,25 @@ pub fn chat_view(
                 });
             stack((
                 drag_handle,
-                container(editor_view(input_editor, debug_breakline, is_active))
+                container(
+                    // Reference pattern (editor/view.rs: normal editor): a
+                    // `scroll` gives the editor a *definite* viewport from the
+                    // parent chain; `absolute()` + `min_size_full()` take the
+                    // editor out of content-flow and fill that viewport, so it
+                    // never sizes to its own (growing) content. With
+                    // `WrapMethod::EditorWidth` the text then wraps to the box
+                    // instead of pushing the chat panel wider.
+                    scroll(
+                        editor_view(input_editor, debug_breakline, is_active)
+                            .style(move |s| {
+                                let _ = config.get();
+                                s.absolute()
+                                    .min_size_full()
+                                    .set(WrapProp, WrapMethod::EditorWidth)
+                            }),
+                    )
+                    .style(|s| s.size_pct(100.0, 100.0)),
+                )
                     .style(move |s| {
                         let config = config.get();
                         s.width_pct(100.0)
@@ -283,6 +303,12 @@ pub fn chat_view(
                             .border_color(config.color(LapceColor::LAPCE_BORDER))
                             .background(config.color(LapceColor::EDITOR_BACKGROUND))
                             .font_size(13.0)
+                            // Internal padding so the caret/text clears the
+                            // rounded border (was blinking in the corner).
+                            .padding_left(10.0)
+                            .padding_right(10.0)
+                            .padding_top(8.0)
+                            .padding_bottom(4.0)
                     }),
                 label(|| "Send".to_string())
                     .on_click_stop(move |_| {
