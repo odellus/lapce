@@ -2507,7 +2507,23 @@ impl WindowTabData {
         let focus = self.common.focus.get_untracked();
         let keypress = self.common.keypress.get_untracked();
         let handle = match focus {
-            Focus::Workbench => self.main_split.key_down(event, &keypress),
+            Focus::Workbench => {
+                // If the active editor tab is a chat, route keys to its input
+                // editor (Enter sends / Shift+Enter newline) exactly like the
+                // panel chat. Otherwise fall through to normal editor keys.
+                if let Some(EditorTabChild::Chat(chat_id)) =
+                    self.main_split.active_child()
+                {
+                    let chat = self.editor_chat(chat_id);
+                    let chat_focus = ChatInputFocus {
+                        editor: chat.input_editor.clone(),
+                        chat,
+                    };
+                    Some(keypress.key_down(event, &chat_focus))
+                } else {
+                    self.main_split.key_down(event, &keypress)
+                }
+            }
             Focus::Palette => Some(keypress.key_down(event, &self.palette)),
             Focus::CodeAction => {
                 let code_action = self.code_action.get_untracked();

@@ -5,7 +5,10 @@ use floem::{
     AnyView, IntoView, View,
     event::{Event, EventListener},
     peniko::kurbo::Point,
-    reactive::{RwSignal, SignalGet, SignalUpdate, create_memo, create_rw_signal},
+    reactive::{
+        RwSignal, SignalGet, SignalUpdate, SignalWith, create_memo,
+        create_rw_signal,
+    },
     style::CursorStyle,
     text::Style as FontStyle,
     views::{
@@ -19,16 +22,28 @@ use crate::{
     command::LapceWorkbenchCommand,
     config::color::LapceColor,
     editor::view::editor_view,
+    editor_tab::EditorTabChild,
     markdown::{MarkdownContent, parse_markdown},
     window_tab::{Focus, WindowTabData},
 };
+
+/// Whether a `chat_view` is the docked panel chat or an independent
+/// editor-tab chat. They differ in how they claim keyboard focus: the panel
+/// chat uses `Focus::Panel(Chat)`, while an editor-tab chat lives under
+/// `Focus::Workbench` (its keys are routed by checking the active editor-tab
+/// child in `window_tab::key_down`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatViewKind {
+    Panel,
+    EditorTab(crate::id::ChatId),
+}
 
 pub fn chat_panel(
     window_tab_data: Rc<WindowTabData>,
     _position: PanelPosition,
 ) -> impl View {
     let chat = window_tab_data.chat.clone();
-    chat_view(chat, window_tab_data)
+    chat_view(chat, window_tab_data, ChatViewKind::Panel)
 }
 
 /// Render a single chat instance. Used both by the chat panel (the
@@ -37,6 +52,7 @@ pub fn chat_panel(
 pub fn chat_view(
     chat: ChatData,
     window_tab_data: Rc<WindowTabData>,
+    kind: ChatViewKind,
 ) -> impl View {
     let config = window_tab_data.common.config;
     let focus = window_tab_data.common.focus;
@@ -55,7 +71,7 @@ pub fn chat_view(
 
     let chat_for_stack = chat.clone();
 
-    stack((
+    let view = stack((
         // Header row — "+ New Chat" opens an independent chat as an editor tab.
         {
             let workbench_command = window_tab_data.common.workbench_command;
@@ -163,13 +179,43 @@ pub fn chat_view(
             let input_editor = chat.input_editor.clone();
             let debug_breakline =
                 create_memo(move |_| None::<(usize, std::path::PathBuf)>);
+            // Copy signals captured by the `is_active` closure (it must be
+            // `Copy`, so it can't hold the `Rc<WindowTabData>`).
+            let active_editor_tab =
+                window_tab_data.main_split.active_editor_tab;
+            let editor_tabs = window_tab_data.main_split.editor_tabs;
             let is_active = move |tracked: bool| {
                 let f = if tracked {
                     focus.get()
                 } else {
                     focus.get_untracked()
                 };
-                f == Focus::Panel(PanelKind::Chat)
+                match kind {
+                    ChatViewKind::Panel => f == Focus::Panel(PanelKind::Chat),
+                    ChatViewKind::EditorTab(id) => {
+                        if f != Focus::Workbench {
+                            return false;
+                        }
+                        // Active iff this chat is the active child of the
+                        // active editor tab (read tracked so the editor-view
+                        // memo re-evaluates on tab switches).
+                        let Some(tab_id) = active_editor_tab.get() else {
+                            return false;
+                        };
+                        let Some(tab) = editor_tabs
+                            .with(|tabs| tabs.get(&tab_id).copied())
+                        else {
+                            return false;
+                        };
+                        tab.with(|t| {
+                            matches!(
+                                t.children.get(t.active),
+                                Some((_, _, EditorTabChild::Chat(cid)))
+                                    if *cid == id
+                            )
+                        })
+                    }
+                }
             };
             // Drag handle above the editor: drag up = taller input.
             // Mirrors lapce's split-divider drag (app.rs): request_active
@@ -264,13 +310,24 @@ pub fn chat_view(
             })
         },
     ))
-    .on_event_stop(EventListener::PointerDown, move |_| {
-        if focus.get_untracked() != Focus::Panel(PanelKind::Chat) {
-            focus.set(Focus::Panel(PanelKind::Chat));
-        }
-    })
     .style(|s| s.flex_col().size_pct(100.0, 100.0))
-    .debug_name("Chat Panel")
+    .debug_name("Chat Panel");
+
+    // Claim keyboard focus on click. The panel chat owns `Focus::Panel(Chat)`
+    // (and stops propagation). An editor-tab chat lives under
+    // `Focus::Workbench`: we let the click bubble up to the editor-tab
+    // container (app.rs), which sets `Focus::Workbench` and activates this
+    // tab — `window_tab::key_down` then routes keys to this chat's input.
+    match kind {
+        ChatViewKind::Panel => {
+            view.on_event_stop(EventListener::PointerDown, move |_| {
+                if focus.get_untracked() != Focus::Panel(PanelKind::Chat) {
+                    focus.set(Focus::Panel(PanelKind::Chat));
+                }
+            })
+        }
+        ChatViewKind::EditorTab(_) => view,
+    }
 }
 
 fn render_block(

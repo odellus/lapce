@@ -501,6 +501,20 @@ impl MainSplitData {
         }
     }
 
+    /// The active child of the active editor tab, if any. Used by
+    /// `window_tab::key_down` to detect when a chat editor-tab is focused so
+    /// keys can be routed to its input (Enter sends / Shift+Enter newline).
+    pub fn active_child(&self) -> Option<EditorTabChild> {
+        let active_editor_tab = self.active_editor_tab.get_untracked()?;
+        let editor_tab = self.editor_tabs.with_untracked(|editor_tabs| {
+            editor_tabs.get(&active_editor_tab).copied()
+        })?;
+        let (_, _, child) = editor_tab.with_untracked(|editor_tab| {
+            editor_tab.children.get(editor_tab.active).cloned()
+        })?;
+        Some(child)
+    }
+
     pub fn key_down<'a>(
         &self,
         event: impl Into<EventRef<'a>>,

@@ -1412,6 +1412,7 @@ fn editor_tab_content(
                 crate::panel::chat_view::chat_view(
                     chat,
                     window_tab_data.clone(),
+                    crate::panel::chat_view::ChatViewKind::EditorTab(chat_id),
                 )
                 .into_any()
             }
