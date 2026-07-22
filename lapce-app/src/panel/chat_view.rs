@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
 use floem::{
     AnyView, IntoView, View,
-    event::{Event, EventListener},
+    event::{Event, EventListener, EventPropagation},
+    peniko::Color,
     peniko::kurbo::Point,
     reactive::{
         RwSignal, SignalGet, SignalUpdate, SignalWith, create_memo,
@@ -18,8 +20,11 @@ use floem::{
 
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
-    chat::{ChatBlock, ChatData, ToolStatus},
-    command::LapceWorkbenchCommand,
+    chat::{
+        ChatBlock, ChatData, ChatDiffLineKind, ToolStatus, diff_lines,
+        extract_file_path,
+    },
+    command::{InternalCommand, LapceWorkbenchCommand},
     config::color::LapceColor,
     editor::view::editor_view,
     editor_tab::EditorTabChild,
@@ -104,7 +109,9 @@ pub fn chat_view(
             )
             .style(|s| s.width_pct(100.0).justify_end().padding(8.0))
         },
-        // Message list — one continuous scroll, no borders between blocks
+        // Message list — one continuous scroll, no borders between blocks.
+        // 16px padding insets every block (markdown, tool fixtures) from the
+        // panel edge, matching crow-ade's `.sc-messages { padding: 16px }`.
         container({
             scroll({
                 dyn_stack(
@@ -114,7 +121,7 @@ pub fn chat_view(
                         render_block(block, config, chat_for_stack.clone())
                     },
                 )
-                .style(|s| s.flex_col().width_pct(100.0))
+                .style(|s| s.flex_col().width_pct(100.0).padding(16.0))
             })
             .scroll_to(move || scroll_target.get())
             .style(|s| s.absolute().size_pct(100.0, 100.0))
@@ -306,7 +313,10 @@ pub fn chat_view(
                 s.flex_col()
                     .items_start()
                     .width_pct(100.0)
-                    .padding(12.0)
+                    // Match the message list's 16px horizontal margins so the
+                    // input doesn't butt against the panel edge either.
+                    .padding_horiz(16.0)
+                    .padding_vert(12.0)
             })
         },
     ))
@@ -352,10 +362,13 @@ fn render_block(
             raw_input,
             raw_output,
             terminal_id,
+            diff_path,
+            old_text,
+            new_text,
             ..
         } => render_tool_call(
             title, kind, status, raw_input, raw_output, terminal_id,
-            config, chat.clone(),
+            diff_path, old_text, new_text, config, chat.clone(),
         )
         .into_any(),
         ChatBlock::System { text, .. } => {
@@ -489,6 +502,19 @@ fn render_thinking_block(
     })
 }
 
+/// Strip a leading `read:`/`write:`/`edit:` (or space) prefix from a tool
+/// title, mirroring crow-ade's `toolCallItem` (the path is shown as a link
+/// instead, so the prefix is redundant noise).
+fn strip_tool_prefix(title: &str) -> String {
+    let lower = title.to_lowercase();
+    for prefix in ["read:", "write:", "edit:", "read ", "write ", "edit "] {
+        if lower.starts_with(prefix) {
+            return title[prefix.len()..].trim().to_string();
+        }
+    }
+    title.to_string()
+}
+
 /// Tool call — compact card with border, matching crow-ade's .sc-tool-call.
 fn render_tool_call(
     title: String,
@@ -497,13 +523,32 @@ fn render_tool_call(
     raw_input: Option<String>,
     raw_output: Option<String>,
     terminal_id: Option<String>,
+    diff_path: Option<String>,
+    old_text: Option<String>,
+    new_text: Option<String>,
     config: floem::reactive::ReadSignal<std::sync::Arc<crate::config::LapceConfig>>,
     chat: ChatData,
 ) -> impl View {
     let open = create_rw_signal(true);
     let status_icon = status.icon().to_string();
     let kind_label = kind.clone();
-    let title_label = title.clone();
+
+    // File path for a clickable "open file" link (edit/write carry it on the
+    // diff block; read/etc. carry it in their rawInput args).
+    let file_path =
+        extract_file_path(diff_path.as_deref(), raw_input.as_deref());
+    let is_link = file_path.is_some();
+    // Read tools render ONLY a clickable link — never dump the file body.
+    let is_read = kind == "read" || title.to_lowercase().starts_with("read");
+    // Header text: the file path when we have one (rendered as a clickable
+    // link), else the title with any read:/write:/edit: prefix stripped.
+    let header_text = match &file_path {
+        Some(p) => p.clone(),
+        None => strip_tool_prefix(&title),
+    };
+    let internal_command = chat.common.internal_command;
+    let path_for_click = file_path.clone();
+
     let input_text = raw_input.unwrap_or_default();
     let output_text = raw_output.unwrap_or_default();
 
@@ -544,16 +589,36 @@ fn render_tool_call(
                         .margin_right(8.0)
                         .selectable(false)
                 }),
-                label(move || title_label.clone()).style(move |s| {
-                    let config = config.get();
-                    s.flex_grow(1.0)
-                        .flex_basis(0.0)
-                        .font_size(11.0)
-                        .font_family(config.editor.font_family.clone())
-                        .color(config.color(LapceColor::EDITOR_LINK))
-                        .text_ellipsis()
-                        .selectable(false)
-                }),
+                label(move || header_text.clone())
+                    .on_click(move |_| {
+                        if let Some(p) = &path_for_click {
+                            internal_command.send(InternalCommand::OpenFile {
+                                path: PathBuf::from(p),
+                            });
+                            EventPropagation::Stop
+                        } else {
+                            // Not a file link — let the click bubble up to the
+                            // header's collapse toggle.
+                            EventPropagation::Continue
+                        }
+                    })
+                    .style(move |s| {
+                        let config = config.get();
+                        s.flex_grow(1.0)
+                            .flex_basis(0.0)
+                            .font_size(11.0)
+                            .font_family(config.editor.font_family.clone())
+                            .color(config.color(if is_link {
+                                LapceColor::EDITOR_LINK
+                            } else {
+                                LapceColor::EDITOR_FOREGROUND
+                            }))
+                            .text_ellipsis()
+                            .selectable(false)
+                            .apply_if(is_link, |s| {
+                                s.cursor(CursorStyle::Pointer)
+                            })
+                    }),
                 label(move || {
                     if open.get() {
                         "▾"
@@ -598,6 +663,19 @@ fn render_tool_call(
                         .apply_if(!open.get(), |s| s.hide())
                 })
                 .into_any()
+            } else if let Some(new_text) = new_text {
+                // edit/write tool: render an inline diff (edit = old→new;
+                // write = old_text None → all-added new-file view).
+                container(render_diff_content(old_text, new_text, config))
+                    .style(move |s| {
+                        s.width_pct(100.0)
+                            .apply_if(!open.get(), |s| s.hide())
+                    })
+                    .into_any()
+            } else if is_read {
+                // Read tool: show nothing but the clickable path link in the
+                // header — never dump the file body into the chat.
+                empty().into_any()
             } else {
                 let input_empty = input_text.is_empty();
                 let output_empty = output_text.is_empty();
@@ -648,6 +726,84 @@ fn render_tool_call(
             .border_color(config.color(LapceColor::LAPCE_BORDER))
             .background(config.color(LapceColor::EDITOR_BACKGROUND))
     })
+}
+
+/// Render an inline diff for an edit/write tool call. `old_text` None ⇒ a
+/// Render the inline diff body for an edit/write tool call. `old_text` None
+/// ⇒ a brand-new file (write): every line renders as "added". The clickable
+/// path header lives in the tool fixture header (see `render_tool_call`).
+fn render_diff_content(
+    old_text: Option<String>,
+    new_text: String,
+    config: floem::reactive::ReadSignal<std::sync::Arc<crate::config::LapceConfig>>,
+) -> impl View {
+    let lines: Vec<(usize, crate::chat::ChatDiffLine)> =
+        diff_lines(&old_text.unwrap_or_default(), &new_text)
+            .into_iter()
+            .enumerate()
+            .collect();
+
+    container(
+        dyn_stack(
+            move || lines.clone(),
+            |(i, _)| *i,
+            move |(_, line)| diff_line_view(line, config),
+        )
+        .style(|s| s.flex_col().width_pct(100.0)),
+    )
+    .style(|s| s.width_pct(100.0).padding_bottom(6.0))
+}
+
+/// One line of the inline diff: a `+`/`-`/` ` marker + text, tinted
+/// green (added) / red (removed) / plain (context).
+fn diff_line_view(
+    line: crate::chat::ChatDiffLine,
+    config: floem::reactive::ReadSignal<std::sync::Arc<crate::config::LapceConfig>>,
+) -> impl View {
+    let kind = line.kind;
+    let marker = match kind {
+        ChatDiffLineKind::Added => "+",
+        ChatDiffLineKind::Removed => "-",
+        ChatDiffLineKind::Context => " ",
+    }
+    .to_string();
+    let text = line.text;
+
+    label(move || format!("{marker} {text}"))
+        .style(move |s| {
+            let config = config.get();
+            let (fg, bg) = match kind {
+                ChatDiffLineKind::Added => {
+                    let c = config
+                        .color(LapceColor::SOURCE_CONTROL_ADDED)
+                        .to_rgba8();
+                    (
+                        config.color(LapceColor::SOURCE_CONTROL_ADDED),
+                        Color::from_rgba8(c.r, c.g, c.b, 28),
+                    )
+                }
+                ChatDiffLineKind::Removed => {
+                    let c = config
+                        .color(LapceColor::SOURCE_CONTROL_REMOVED)
+                        .to_rgba8();
+                    (
+                        config.color(LapceColor::SOURCE_CONTROL_REMOVED),
+                        Color::from_rgba8(c.r, c.g, c.b, 28),
+                    )
+                }
+                ChatDiffLineKind::Context => (
+                    config.color(LapceColor::EDITOR_FOREGROUND),
+                    Color::TRANSPARENT,
+                ),
+            };
+            s.width_pct(100.0)
+                .font_size(12.0)
+                .font_family(config.editor.font_family.clone())
+                .color(fg)
+                .background(bg)
+                .padding_horiz(10.0)
+                .selectable(true)
+        })
 }
 
 fn render_system_text(
