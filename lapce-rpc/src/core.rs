@@ -146,6 +146,34 @@ pub enum CoreNotification {
         path: PathBuf,
         breakpoints: Vec<dap_types::Breakpoint>,
     },
+    // ── ACP (Agent Client Protocol) ──────────────────────────────────
+    /// A new ACP session was created successfully.
+    AcpSessionCreated {
+        session_id: String,
+    },
+    /// ACP session creation failed.
+    AcpSessionFailed {
+        error: String,
+    },
+    /// Streaming session update from an ACP agent.
+    AcpSessionUpdate {
+        session_id: String,
+        update: serde_json::Value,
+    },
+    /// An ACP session's agent process disconnected.
+    AcpDisconnected {
+        session_id: String,
+    },
+    /// Raw bytes from an ACP client-side terminal (for inline chat rendering).
+    AcpTerminalData {
+        terminal_id: String,
+        data: Vec<u8>,
+    },
+    /// An ACP client-side terminal process exited.
+    AcpTerminalExit {
+        terminal_id: String,
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +393,20 @@ impl CoreRpcHandler {
 
     pub fn update_terminal(&self, term_id: TermId, content: Vec<u8>) {
         self.notification(CoreNotification::UpdateTerminal { term_id, content });
+    }
+
+    pub fn acp_terminal_data(&self, terminal_id: String, data: Vec<u8>) {
+        self.notification(CoreNotification::AcpTerminalData {
+            terminal_id,
+            data,
+        });
+    }
+
+    pub fn acp_terminal_exit(&self, terminal_id: String, exit_code: Option<i32>) {
+        self.notification(CoreNotification::AcpTerminalExit {
+            terminal_id,
+            exit_code,
+        });
     }
 
     pub fn dap_stopped(

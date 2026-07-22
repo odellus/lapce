@@ -1,6 +1,9 @@
 pub mod about;
 pub mod alert;
 pub mod app;
+pub mod chat;
+pub mod chat_terminal;
+pub mod notes;
 pub mod code_action;
 pub mod code_lens;
 pub mod command;

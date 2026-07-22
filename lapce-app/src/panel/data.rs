@@ -29,6 +29,7 @@ pub fn default_panel_order() -> PanelOrder {
             PanelKind::Plugin,
             PanelKind::SourceControl,
             PanelKind::Debug,
+            PanelKind::Notes,
         ],
     );
     order.insert(
@@ -39,12 +40,13 @@ pub fn default_panel_order() -> PanelOrder {
             PanelKind::Problem,
             PanelKind::CallHierarchy,
             PanelKind::References,
-            PanelKind::Implementation
+            PanelKind::Implementation,
+            PanelKind::Chat,
         ],
     );
     order.insert(
         PanelPosition::RightTop,
-        im::vector![PanelKind::DocumentSymbol,],
+        im::vector![PanelKind::DocumentSymbol, PanelKind::TypstPreview,],
     );
 
     order

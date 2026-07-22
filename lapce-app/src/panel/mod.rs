@@ -1,4 +1,7 @@
 pub mod call_hierarchy_view;
+pub mod chat_view;
+pub mod notes_view;
+pub mod typst_preview;
 pub mod data;
 pub mod debug_view;
 pub mod document_symbol;

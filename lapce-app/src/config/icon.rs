@@ -32,6 +32,9 @@ impl LapceIcons {
     pub const UNSAVED: &'static str = "unsaved";
     pub const WARNING: &'static str = "warning";
     pub const TERMINAL: &'static str = "terminal";
+    pub const CHAT: &'static str = "chat";
+    pub const PREVIEW: &'static str = "preview";
+    pub const NOTES: &'static str = "notes";
     pub const SETTINGS: &'static str = "settings";
     pub const LIGHTBULB: &'static str = "lightbulb";
     pub const EXTENSIONS: &'static str = "extensions";

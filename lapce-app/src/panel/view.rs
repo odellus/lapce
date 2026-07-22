@@ -17,14 +17,17 @@ use floem::{
 };
 
 use super::{
+    chat_view::chat_panel,
     debug_view::debug_panel,
     global_search_view::global_search_panel,
     kind::PanelKind,
+    notes_view::notes_panel,
     plugin_view::plugin_panel,
     position::{PanelContainerPosition, PanelPosition},
     problem_view::problem_panel,
     source_control_view::source_control_panel,
     terminal_view::terminal_panel,
+    typst_preview::typst_preview_panel,
 };
 use crate::{
     app::{clickable_icon, clickable_icon_base},
@@ -507,6 +510,15 @@ fn panel_view(
                     implementation_panel(window_tab_data.clone(), position)
                         .into_any()
                 }
+                PanelKind::Chat => {
+                    chat_panel(window_tab_data.clone(), position).into_any()
+                }
+                PanelKind::TypstPreview => {
+                    typst_preview_panel(window_tab_data.clone(), position).into_any()
+                }
+                PanelKind::Notes => {
+                    notes_panel(window_tab_data.clone(), position).into_any()
+                }
             };
             view.style(|s| s.size_pct(100.0, 100.0))
         },
@@ -563,6 +575,9 @@ fn panel_picker(
                 PanelKind::DocumentSymbol => "Document Symbol",
                 PanelKind::References => "References",
                 PanelKind::Implementation => "Implementation",
+                PanelKind::Chat => "Chat",
+                PanelKind::TypstPreview => "Typst Preview",
+                PanelKind::Notes => "Notes",
             };
             let icon = p.svg_name();
             let is_active = {

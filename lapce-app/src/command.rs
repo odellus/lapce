@@ -797,6 +797,7 @@ pub enum InternalCommand {
     RestartTerminal {
         term_id: TermId,
     },
+    ExportTypstPdf,
 }
 
 #[derive(Clone)]

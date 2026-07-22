@@ -54,6 +54,7 @@ use tracing::{Level, debug, error, event};
 use crate::{
     about::AboutData,
     alert::{AlertBoxData, AlertButton},
+    chat::ChatData,
     code_action::{CodeActionData, CodeActionStatus},
     command::{
         CommandExecuted, CommandKind, InternalCommand, LapceCommand,
@@ -179,6 +180,10 @@ pub struct WindowTabData {
     pub code_action: RwSignal<CodeActionData>,
     pub code_lens: RwSignal<Option<ViewId>>,
     pub source_control: SourceControlData,
+    pub chat: ChatData,
+    pub typst_view: floem_typst::TypstView,
+    pub typst_source: RwSignal<String>,
+    pub notes: crate::notes::NotesData,
     pub rename: RenameData,
     pub global_search: GlobalSearchData,
     pub call_hierarchy_data: CallHierarchyData,
@@ -396,6 +401,10 @@ impl WindowTabData {
             cx.create_rw_signal(CodeActionData::new(cx, common.clone()));
         let source_control =
             SourceControlData::new(cx, main_split.editors, common.clone());
+        let chat = ChatData::new(cx, common.clone());
+        let typst_view = floem_typst::TypstView::new();
+        let typst_source = cx.create_rw_signal(String::new());
+        let notes = crate::notes::NotesData::new(cx, common.clone());
         let file_explorer =
             FileExplorerData::new(cx, main_split.editors, common.clone());
 
@@ -555,6 +564,10 @@ impl WindowTabData {
             code_action,
             code_lens: cx.create_rw_signal(None),
             source_control,
+            chat,
+            typst_view,
+            typst_source,
+            notes,
             plugin,
             rename,
             global_search,
@@ -623,6 +636,68 @@ impl WindowTabData {
                         window_tab_data.handle_core_notification(rpc);
                     }
                 });
+            });
+        }
+
+        // Typst live preview: watch active editor's doc buffer, recompile on change
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::Arc;
+
+            let typst_view = window_tab_data.typst_view.clone();
+            let active_editor = window_tab_data.main_split.active_editor;
+            let scope = window_tab_data.scope;
+            let debounce_gen = Arc::new(AtomicU64::new(0));
+
+            cx.create_effect(move |_| {
+                // Track active editor
+                let Some(editor) = active_editor.get() else { return };
+                let doc = editor.doc();
+
+                // Track buffer changes (re-runs effect on every edit)
+                let _rev = doc.buffer.with(|b| b.rev());
+
+                // Only preview .typ files
+                let is_typ = doc.content.with_untracked(|c| {
+                    c.path()
+                        .and_then(|p| p.extension())
+                        .map(|e| e == "typ")
+                        .unwrap_or(false)
+                });
+                if !is_typ {
+                    return;
+                }
+
+                let text = doc.buffer.with_untracked(|b| b.to_string());
+
+                // Debounce: bump generation, spawn thread
+                let g = debounce_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                let debounce_gen = debounce_gen.clone();
+                let tv = typst_view.clone();
+                let send = create_ext_action(scope, move |()| {
+                    tv.reset();
+                    tv.push(&text);
+                    tv.flush();
+                });
+                let _ = std::thread::Builder::new()
+                    .name("typst-preview".to_owned())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        if debounce_gen.load(Ordering::Relaxed) != g {
+                            return; // superseded by a newer edit
+                        }
+                        send(());
+                    });
+            });
+        }
+
+        // Eagerly create the ACP session so the chat is ready before the
+        // user types (no "send a message to init"). Runs once: ensure_session
+        // reads via get_untracked so this effect never re-runs.
+        {
+            let chat = window_tab_data.chat.clone();
+            cx.create_effect(move |_| {
+                chat.ensure_session();
             });
         }
 
@@ -2070,6 +2145,9 @@ impl WindowTabData {
             InternalCommand::CallHierarchyIncoming { item_id } => {
                 self.call_hierarchy_incoming(item_id);
             }
+            InternalCommand::ExportTypstPdf => {
+                self.export_typst_pdf();
+            }
         }
     }
 
@@ -2317,6 +2395,32 @@ impl WindowTabData {
             }
             CoreNotification::WorkspaceFileChange => {
                 self.file_explorer.reload();
+            }
+            // ── ACP ──────────────────────────────────────────────────
+            CoreNotification::AcpSessionCreated { session_id } => {
+                self.chat.handle_session_created(session_id.clone());
+            }
+            CoreNotification::AcpSessionFailed { error } => {
+                self.chat.handle_session_failed(error.clone());
+            }
+            CoreNotification::AcpSessionUpdate { update, .. } => {
+                self.chat.handle_session_update(update.clone());
+            }
+            CoreNotification::AcpDisconnected { .. } => {
+                self.chat.handle_disconnected();
+            }
+            CoreNotification::AcpTerminalData {
+                terminal_id,
+                data,
+            } => {
+                self.chat.handle_terminal_data(&terminal_id, &data);
+            }
+            CoreNotification::AcpTerminalExit {
+                terminal_id,
+                ..
+            } => {
+                // Trigger a final repaint so the grid shows the last state.
+                self.chat.handle_terminal_data(&terminal_id, b"");
             }
             _ => {}
         }
@@ -2630,12 +2734,14 @@ impl WindowTabData {
             | PanelKind::CallHierarchy
             | PanelKind::DocumentSymbol
             | PanelKind::References
-            | PanelKind::Implementation => {
+            | PanelKind::Implementation
+            | PanelKind::TypstPreview
+            | PanelKind::Notes => {
                 // Some panels don't accept focus (yet). Fall back to visibility check
                 // in those cases.
                 self.panel.is_panel_visible(&kind)
             }
-            PanelKind::Terminal | PanelKind::SourceControl | PanelKind::Search => {
+            PanelKind::Terminal | PanelKind::SourceControl | PanelKind::Search | PanelKind::Chat => {
                 self.is_panel_focused(kind)
             }
         };
@@ -2973,6 +3079,42 @@ impl WindowTabData {
             item.get_untracked().item.as_ref().clone(),
             send,
         );
+    }
+
+    fn export_typst_pdf(&self) {
+        let Some(editor) = self.main_split.active_editor.get_untracked() else {
+            return;
+        };
+        let doc = editor.doc();
+        let Some(path) = doc.content.with_untracked(|c| c.path().cloned()) else {
+            return;
+        };
+        if path.extension().map(|e| e != "typ").unwrap_or(true) {
+            return;
+        }
+        let text = doc.buffer.with_untracked(|b| b.to_string());
+        let pdf_path = path.with_extension("pdf");
+        let scope = self.scope;
+        let send = create_ext_action(scope, move |result: Result<Vec<u8>, String>| {
+            match result {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&pdf_path, &bytes) {
+                        tracing::error!("Failed to write PDF: {e}");
+                    } else {
+                        tracing::info!("Exported PDF: {}", pdf_path.display());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Typst PDF export failed: {e}");
+                }
+            }
+        });
+        let _ = std::thread::Builder::new()
+            .name("typst-pdf-export".to_owned())
+            .spawn(move || {
+                let result = floem_typst::render_to_pdf(&text);
+                send(result);
+            });
     }
 }
 

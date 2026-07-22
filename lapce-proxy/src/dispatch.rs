@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fs,
+    io::{self},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -43,6 +44,7 @@ use lsp_types::{
 use parking_lot::Mutex;
 
 use crate::{
+    acp::{AgentConfig, AcpSessionManager, SessionEvent},
     buffer::{Buffer, get_mod_time, load_file},
     plugin::{PluginCatalogRpcHandler, catalog::PluginCatalog},
     terminal::{Terminal, TerminalSender},
@@ -62,6 +64,19 @@ pub struct Dispatcher {
     file_watcher: FileWatcher,
     window_id: usize,
     tab_id: usize,
+    acp_manager: AcpSessionManager,
+    /// ACP client-side terminals (keyed by the string terminalId we return
+    /// to the agent). Each entry holds the shared terminal state (output
+    /// buffer + exit status, streamed to the UI and returned to the agent)
+    /// plus the ACP `outputByteLimit` from `terminal/create`.
+    acp_terminals: HashMap<String, AcpTermEntry>,
+    acp_terminal_next_id: u64,
+}
+
+/// One client-side ACP terminal tracked by the dispatcher.
+struct AcpTermEntry {
+    term: Arc<crate::acp::AcpTerminal>,
+    output_byte_limit: Option<usize>,
 }
 
 impl ProxyHandler for Dispatcher {
@@ -397,6 +412,124 @@ impl ProxyHandler for Dispatcher {
                     None,
                     false,
                 );
+            }
+            // ── ACP ──────────────────────────────────────────────────
+            AcpCreateSession {
+                agent_name,
+                command,
+                args,
+                env,
+                cwd,
+            } => {
+                tracing::info!(
+                    agent = %agent_name,
+                    command = %command,
+                    cwd = %cwd,
+                    "ACP: received create session request"
+                );
+                let config = AgentConfig {
+                    name: agent_name,
+                    command,
+                    args,
+                    env,
+                };
+                let cwd = if cwd.is_empty() {
+                    self.workspace
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                } else {
+                    cwd
+                };
+
+                let (event_tx, event_rx) =
+                    crossbeam_channel::unbounded::<SessionEvent>();
+
+                // Forward session events → CoreNotification.
+                let core_rpc = self.core_rpc.clone();
+                thread::Builder::new()
+                    .name("acp-event-fwd".to_string())
+                    .spawn(move || {
+                        while let Ok(event) = event_rx.recv() {
+                            match event {
+                                SessionEvent::Update {
+                                    session_id,
+                                    update,
+                                } => {
+                                    core_rpc.notification(
+                                        CoreNotification::AcpSessionUpdate {
+                                            session_id,
+                                            update,
+                                        },
+                                    );
+                                }
+                                SessionEvent::Disconnected { session_id } => {
+                                    core_rpc.notification(
+                                        CoreNotification::AcpDisconnected {
+                                            session_id,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+
+                // Client-tool requests (fs/terminal) are injected back into
+                // this loop as `AcpClientTool` notifications (see the session
+                // reader) and handled below with `&mut self` — against the
+                // open document model. No detached thread, no permission UI.
+
+                match self.acp_manager.create_session(
+                    config,
+                    &cwd,
+                    vec![],
+                    event_tx,
+                    self.proxy_rpc.clone(),
+                ) {
+                    Ok(session) => {
+                        let session_id = session.session_id();
+                        tracing::info!(session = %session_id, "ACP: session created, notifying core");
+                        self.core_rpc.notification(
+                            CoreNotification::AcpSessionCreated { session_id },
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "ACP: session creation failed, notifying core");
+                        self.core_rpc.notification(
+                            CoreNotification::AcpSessionFailed {
+                                error: format!("{}", e),
+                            },
+                        );
+                    }
+                }
+            }
+            AcpPrompt {
+                session_id,
+                content,
+            } => {
+                tracing::info!(session = %session_id, len = content.len(), "ACP: prompt");
+                if let Some(session) = self.acp_manager.get_session(&session_id) {
+                    if let Err(e) = session.prompt_async(&content) {
+                        tracing::error!("ACP prompt failed: {}", e);
+                    }
+                }
+            }
+            AcpCancel { session_id } => {
+                if let Some(session) = self.acp_manager.get_session(&session_id) {
+                    let _ = session.cancel();
+                }
+            }
+            AcpCloseSession { session_id } => {
+                self.acp_manager.close_session(&session_id);
+            }
+            AcpClientTool {
+                session_id,
+                rpc_id,
+                method,
+                params,
+            } => {
+                self.handle_acp_tool(&session_id, &rpc_id, &method, params);
             }
         }
     }
@@ -1225,11 +1358,322 @@ impl Dispatcher {
             file_watcher,
             window_id: 1,
             tab_id: 1,
+            acp_manager: AcpSessionManager::new(),
+            acp_terminals: HashMap::new(),
+            acp_terminal_next_id: 1,
         }
     }
 
     fn respond_rpc(&self, id: RequestId, result: Result<ProxyResponse, RpcError>) {
         self.proxy_rpc.handle_response(id, result);
+    }
+
+    /// Execute an ACP client-tool request on the dispatch thread, where we
+    /// hold `&mut self` and therefore the open document model (`self.buffers`).
+    ///
+    /// `readTextFile` returns the live buffer — unsaved edits included — when
+    /// the path is open, falling back to disk only for files that aren't open.
+    /// `writeTextFile` writes *through* the document model: it updates the
+    /// proxy rope and pushes the new content to the open editor via
+    /// `open_file_changed`, so the agent's edit appears live instead of
+    /// silently desyncing the buffer against a disk-only write.
+    fn handle_acp_tool(
+        &mut self,
+        session_id: &str,
+        rpc_id: &serde_json::Value,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        let session = match self.acp_manager.get_session(session_id) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    session = %session_id,
+                    "ACP client tool for unknown session, ignoring"
+                );
+                return;
+            }
+        };
+
+        match method {
+            "fs/read_text_file" | "readTextFile" => {
+                let path = params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let pbuf = std::path::PathBuf::from(path);
+                // Live document model first (unsaved edits); disk only if the
+                // file isn't currently open in the editor.
+                let from_buffer =
+                    self.buffers.get(&pbuf).map(|b| b.get_document());
+                match from_buffer {
+                    Some(content) => {
+                        let _ = session.send_tool_response(
+                            rpc_id,
+                            serde_json::json!({ "content": content }),
+                        );
+                    }
+                    None => match load_file(std::path::Path::new(path)) {
+                        Ok(content) => {
+                            let _ = session.send_tool_response(
+                                rpc_id,
+                                serde_json::json!({ "content": content }),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = session.send_tool_error(
+                                rpc_id,
+                                -32000,
+                                &format!("readTextFile failed: {e}"),
+                            );
+                        }
+                    },
+                }
+            }
+            "fs/write_text_file" | "writeTextFile" => {
+                let path = params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content = params
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let pbuf = std::path::PathBuf::from(path);
+                if let Some(parent) = pbuf.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let disk = std::fs::write(&pbuf, content);
+                // Write through the open document model so the editor shows
+                // the change live (no desync, no "changed on disk" prompt).
+                if self.buffers.contains_key(&pbuf) {
+                    if let Some(buffer) = self.buffers.get_mut(&pbuf) {
+                        buffer.rope =
+                            lapce_xi_rope::Rope::from(content.to_string());
+                    }
+                    self.core_rpc.open_file_changed(
+                        pbuf.clone(),
+                        FileChanged::Change(content.to_string()),
+                    );
+                }
+                match disk {
+                    Ok(()) => {
+                        let _ = session
+                            .send_tool_response(rpc_id, serde_json::json!({}));
+                    }
+                    Err(e) => {
+                        let _ = session.send_tool_error(
+                            rpc_id,
+                            -32000,
+                            &format!("writeTextFile failed: {e}"),
+                        );
+                    }
+                }
+            }
+            "terminal/create" => {
+                let command = params
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("sh")
+                    .to_string();
+                tracing::info!(
+                    session = %session_id,
+                    command = %command,
+                    "ACP: terminal/create received"
+                );
+                let args: Vec<String> = params
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cwd = params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let env: Vec<(String, String)> = params
+                    .get("env")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                let name = e.get("name")?.as_str()?.to_string();
+                                let value =
+                                    e.get("value")?.as_str()?.to_string();
+                                Some((name, value))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let terminal_id =
+                    format!("acp_term_{}", self.acp_terminal_next_id);
+                self.acp_terminal_next_id += 1;
+
+                // ACP `outputByteLimit`: cap how many bytes `terminal/output`
+                // returns (we keep the tail). None = unlimited.
+                let output_byte_limit = params
+                    .get("outputByteLimit")
+                    .and_then(|v| v.as_u64())
+                    .map(|l| l as usize);
+
+                // crow-cli sends `command` as a single command-line string
+                // (e.g. "ls -la"); fold in any `args` and run it through a REAL
+                // PTY as `shell -c "<cmd>"` — same as crow-ade's crow-acp, so
+                // shell features and isatty behaviour work (a piped subprocess
+                // is not a tty).
+                let cmd_str = if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{} {}", command, args.join(" "))
+                };
+                let env_map: std::collections::HashMap<String, String> =
+                    env.into_iter().collect();
+                let cwd_path = cwd.map(std::path::PathBuf::from);
+
+                match crate::acp::pty::spawn_acp_pty(
+                    &cmd_str, cwd_path, env_map,
+                ) {
+                    Ok(pty) => {
+                        // Shared state: the PTY thread writes output + exit
+                        // here; the dispatch thread reads it for
+                        // terminal/output + terminal/waitForExit; the UI gets
+                        // the same bytes live via the on_data callback.
+                        let term = crate::acp::AcpTerminal::new();
+                        self.acp_terminals.insert(
+                            terminal_id.clone(),
+                            AcpTermEntry {
+                                term: term.clone(),
+                                output_byte_limit,
+                            },
+                        );
+
+                        let core_rpc = self.core_rpc.clone();
+                        let tid = terminal_id.clone();
+                        thread::Builder::new()
+                            .name(format!("acp-term-{tid}"))
+                            .spawn(move || {
+                                let core_rpc2 = core_rpc.clone();
+                                let tid2 = tid.clone();
+                                let code = crate::acp::pty::run_acp_pty(
+                                    pty,
+                                    term,
+                                    move |bytes| {
+                                        core_rpc2.acp_terminal_data(
+                                            tid2.clone(),
+                                            bytes.to_vec(),
+                                        );
+                                    },
+                                );
+                                core_rpc.acp_terminal_exit(tid, code);
+                            })
+                            .ok();
+
+                        let _ = session.send_tool_response(
+                            rpc_id,
+                            serde_json::json!({ "terminalId": terminal_id }),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "ACP: terminal/create spawn failed: {e}"
+                        );
+                        let _ = session.send_tool_error(
+                            rpc_id,
+                            -32000,
+                            &format!("failed to create terminal: {e}"),
+                        );
+                    }
+                }
+            }
+            "terminal/output" => {
+                // Return the accumulated output (what the model "sees"),
+                // honoring outputByteLimit (keep the tail). Include exitStatus
+                // once the process has exited. Shape matches crow-ade's
+                // TerminalOutputResponse: { output, truncated, exitStatus? }.
+                let id = params
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let resp = match self.acp_terminals.get(id) {
+                    Some(entry) => {
+                        let full = entry.term.output_string();
+                        let (output, truncated) = crate::acp::truncate_tail(
+                            &full,
+                            entry.output_byte_limit,
+                        );
+                        let mut r = serde_json::json!({
+                            "output": output,
+                            "truncated": truncated,
+                        });
+                        if entry.term.exited() {
+                            r["exitStatus"] = serde_json::json!({
+                                "exitCode": entry.term.exit_code(),
+                            });
+                        }
+                        r
+                    }
+                    None => serde_json::json!({
+                        "output": "",
+                        "truncated": false,
+                    }),
+                };
+                let _ = session.send_tool_response(rpc_id, resp);
+            }
+            "terminal/waitForExit" | "terminal/wait_for_exit" => {
+                // Block until the process exits so the agent's subsequent
+                // terminal/output sees the complete output. We clone the Arc
+                // and drop the map borrow before blocking. Response shape is
+                // TerminalExitStatus flattened: { exitCode, signal }.
+                let id = params
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let term =
+                    self.acp_terminals.get(&id).map(|e| e.term.clone());
+                let code = match term {
+                    Some(t) => t.wait_exit(None),
+                    None => None,
+                };
+                let _ = session.send_tool_response(
+                    rpc_id,
+                    serde_json::json!({
+                        "exitCode": code,
+                        "signal": null,
+                    }),
+                );
+            }
+            "terminal/kill" => {
+                // Nothing to kill — the thread will exit when the process does.
+                let _ = session
+                    .send_tool_response(rpc_id, serde_json::json!({}));
+            }
+            "terminal/release" => {
+                self.acp_terminals.remove(
+                    params
+                        .get("terminalId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                let _ = session
+                    .send_tool_response(rpc_id, serde_json::json!({}));
+            }
+            other => {
+                tracing::info!(
+                    method = %other,
+                    "ACP client tool not yet implemented in lapce"
+                );
+                let _ = session.send_tool_error(
+                    rpc_id,
+                    -32601,
+                    &format!("client tool `{other}` not implemented in lapce yet"),
+                );
+            }
+        }
     }
 
     fn get_buffer_or_insert(&mut self, path: PathBuf) -> &mut Buffer {
@@ -1759,3 +2203,4 @@ fn search_in_path(
 
     Ok(ProxyResponse::GlobalSearchResponse { matches })
 }
+

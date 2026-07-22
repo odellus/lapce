@@ -351,6 +351,38 @@ pub enum ProxyNotification {
         path: PathBuf,
         breakpoints: Vec<SourceBreakpoint>,
     },
+    // ── ACP (Agent Client Protocol) ──────────────────────────────────
+    /// Create a new ACP session (spawn agent + initialize + session/new).
+    /// Response comes back as `CoreNotification::AcpSessionCreated`.
+    AcpCreateSession {
+        agent_name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<String>,
+        cwd: String,
+    },
+    /// Send a prompt to an ACP session.
+    AcpPrompt {
+        session_id: String,
+        content: String,
+    },
+    /// Cancel the current prompt in an ACP session.
+    AcpCancel {
+        session_id: String,
+    },
+    /// Close an ACP session and kill the agent process.
+    AcpCloseSession {
+        session_id: String,
+    },
+    /// ACP agent issued a client-tool request (fs/terminal). The session
+    /// reader injects this into the dispatch loop so it runs with access to
+    /// the open document model. There is no permission system — tools execute.
+    AcpClientTool {
+        session_id: String,
+        rpc_id: serde_json::Value,
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
