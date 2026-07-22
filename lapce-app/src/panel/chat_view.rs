@@ -3,14 +3,12 @@ use std::sync::atomic::AtomicU64;
 
 use floem::{
     AnyView, IntoView, View,
-    event::{Event, EventListener},
-    keyboard::{Key, NamedKey},
-    reactive::{RwSignal, SignalGet, SignalUpdate, create_rw_signal},
+    event::EventListener,
+    reactive::{RwSignal, SignalGet, SignalUpdate, create_memo, create_rw_signal},
     style::CursorStyle,
     text::Style as FontStyle,
     views::{
-        Decorators, container, dyn_stack, empty, label, rich_text, scroll,
-        stack, text_input,
+        Decorators, container, dyn_stack, empty, label, rich_text, scroll, stack,
     },
 };
 
@@ -19,6 +17,7 @@ use crate::{
     chat::{ChatBlock, ChatData, ToolStatus},
     command::LapceWorkbenchCommand,
     config::color::LapceColor,
+    editor::view::editor_view,
     markdown::{MarkdownContent, parse_markdown},
     window_tab::{Focus, WindowTabData},
 };
@@ -155,32 +154,32 @@ pub fn chat_view(
                     .apply_if(!is_loading.get(), |s| s.hide())
             })
         },
-        // Input area
+        // Input area — a real multi-line lapce editor. Enter sends,
+        // Shift+Enter inserts a newline (wired via ChatInputFocus + the
+        // Focus::Panel(Chat) key route in window_tab).
         {
-            let chat_for_key = chat.clone();
             let chat_for_click = chat.clone();
-            let input_text = chat.input;
+            let input_editor = chat.input_editor.clone();
+            let debug_breakline =
+                create_memo(move |_| None::<(usize, std::path::PathBuf)>);
+            let is_active = move |tracked: bool| {
+                let f = if tracked {
+                    focus.get()
+                } else {
+                    focus.get_untracked()
+                };
+                f == Focus::Panel(PanelKind::Chat)
+            };
             stack((
-                text_input(input_text)
-                    .placeholder("Ask anything...")
-                    .on_event_stop(EventListener::KeyDown, move |event| {
-                        if let Event::KeyDown(key_event) = event {
-                            if key_event.key.logical_key
-                                == Key::Named(NamedKey::Enter)
-                            {
-                                chat_for_key.send_prompt();
-                            }
-                        }
-                    })
+                container(editor_view(input_editor, debug_breakline, is_active))
                     .style(move |s| {
                         let config = config.get();
                         s.width_pct(100.0)
-                            .padding(10.0)
+                            .height(200.0)
                             .border(1.0)
                             .border_radius(8.0)
                             .border_color(config.color(LapceColor::LAPCE_BORDER))
                             .background(config.color(LapceColor::EDITOR_BACKGROUND))
-                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
                             .font_size(13.0)
                     }),
                 label(|| "Send".to_string())
@@ -189,7 +188,7 @@ pub fn chat_view(
                     })
                     .style(move |s| {
                         let config = config.get();
-                        s.margin_left(6.0)
+                        s.margin_top(6.0)
                             .padding_horiz(12.0)
                             .padding_vert(6.0)
                             .items_center()
@@ -208,7 +207,12 @@ pub fn chat_view(
                             })
                     }),
             ))
-            .style(|s| s.width_pct(100.0).padding(12.0).items_center())
+            .style(|s| {
+                s.flex_col()
+                    .items_start()
+                    .width_pct(100.0)
+                    .padding(12.0)
+            })
         },
     ))
     .on_event_stop(EventListener::PointerDown, move |_| {

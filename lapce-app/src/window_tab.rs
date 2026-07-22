@@ -54,7 +54,7 @@ use tracing::{Level, debug, error, event};
 use crate::{
     about::AboutData,
     alert::{AlertBoxData, AlertButton},
-    chat::ChatData,
+    chat::{ChatData, ChatInputFocus},
     code_action::{CodeActionData, CodeActionStatus},
     command::{
         CommandExecuted, CommandKind, InternalCommand, LapceCommand,
@@ -410,7 +410,7 @@ impl WindowTabData {
             cx.create_rw_signal(CodeActionData::new(cx, common.clone()));
         let source_control =
             SourceControlData::new(cx, main_split.editors, common.clone());
-        let chat = ChatData::new(cx, common.clone());
+        let chat = ChatData::new(cx, main_split.editors, common.clone());
         let typst_view = floem_typst::TypstView::new();
         let typst_source = cx.create_rw_signal(String::new());
         let notes = crate::notes::NotesData::new(cx, common.clone());
@@ -930,7 +930,8 @@ impl WindowTabData {
             NewChatTab => {
                 // A fresh, independent chat instance (its own ACP session),
                 // opened as an editor tab so several chats can run at once.
-                let chat = ChatData::new(self.scope, self.common.clone());
+                let chat =
+                    ChatData::new(self.scope, self.main_split.editors, self.common.clone());
                 self.register_chat(chat.clone());
                 chat.ensure_session();
                 self.main_split.open_chat_tab(chat.chat_id);
@@ -2188,7 +2189,12 @@ impl WindowTabData {
         if let Some(chat) = self.chats.borrow().get(&id) {
             return chat.clone();
         }
-        let chat = ChatData::new_with_id(self.scope, self.common.clone(), id);
+        let chat = ChatData::new_with_id(
+            self.scope,
+            self.main_split.editors,
+            self.common.clone(),
+            id,
+        );
         self.register_chat(chat.clone());
         chat.ensure_session();
         chat
@@ -2520,6 +2526,15 @@ impl WindowTabData {
             }
             Focus::Panel(PanelKind::SourceControl) => {
                 Some(keypress.key_down(event, &self.source_control))
+            }
+            Focus::Panel(PanelKind::Chat) => {
+                // Route keys to the chat input editor: it types like a normal
+                // editor, but a bare Enter sends the prompt (ChatInputFocus).
+                let chat_focus = ChatInputFocus {
+                    editor: self.chat.input_editor.clone(),
+                    chat: self.chat.clone(),
+                };
+                Some(keypress.key_down(event, &chat_focus))
             }
             _ => None,
         };

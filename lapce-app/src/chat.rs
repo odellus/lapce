@@ -3,13 +3,19 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
-use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate};
+use floem::keyboard::Modifiers;
+use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith};
+use floem::views::editor::command::CommandExecuted;
+use lapce_core::command::EditCommand;
+use lapce_core::mode::Mode;
 use lapce_rpc::proxy::ProxyNotification;
 use lapce_xi_rope::Rope;
 
 use crate::chat_terminal::{ChatRawTerminal, ChatTermHandle};
+use crate::command::{CommandKind, LapceCommand};
 use crate::editor::EditorData;
 use crate::id::ChatId;
+use crate::keypress::{KeyPressFocus, condition::Condition};
 use crate::main_split::Editors;
 use crate::window_tab::CommonData;
 
@@ -106,8 +112,10 @@ pub struct ChatData {
     pub session_id: RwSignal<Option<String>>,
     /// Whether the agent is currently processing a prompt.
     pub is_loading: RwSignal<bool>,
-    /// Text input buffer for the next message.
-    pub input: RwSignal<String>,
+    /// The chat input, a real (multi-line) lapce editor backed by an
+    /// in-memory local doc. Enter sends / Shift+Enter inserts a newline
+    /// (handled by `ChatInputFocus` + the `Focus::Panel(Chat)` key route).
+    pub input_editor: EditorData,
     /// Monotonically increasing counter, bumped on every block mutation.
     /// The view watches this to trigger auto-scroll.
     pub scroll_version: RwSignal<u64>,
@@ -129,6 +137,51 @@ pub struct ChatData {
     /// string terminalId the agent receives from terminal/create.
     pub terminals: Rc<std::cell::RefCell<HashMap<String, ChatTermHandle>>>,
     pub common: Rc<CommonData>,
+}
+
+/// Key focus for the chat input editor. Wraps the input `EditorData` so it
+/// types like a normal editor, but intercepts a bare **Enter** to send the
+/// prompt (Shift+Enter still inserts a newline). `get_mode` always returns
+/// `Mode::Insert` so keys insert text regardless of the global modal setting.
+#[derive(Clone)]
+pub struct ChatInputFocus {
+    pub editor: EditorData,
+    pub chat: ChatData,
+}
+
+impl std::fmt::Debug for ChatInputFocus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatInputFocus").finish_non_exhaustive()
+    }
+}
+
+impl KeyPressFocus for ChatInputFocus {
+    fn get_mode(&self) -> Mode {
+        Mode::Insert
+    }
+
+    fn check_condition(&self, condition: Condition) -> bool {
+        self.editor.check_condition(condition)
+    }
+
+    fn run_command(
+        &self,
+        command: &LapceCommand,
+        count: Option<usize>,
+        mods: Modifiers,
+    ) -> CommandExecuted {
+        if let CommandKind::Edit(EditCommand::InsertNewLine) = &command.kind {
+            if !mods.contains(Modifiers::SHIFT) {
+                self.chat.send_prompt();
+                return CommandExecuted::Yes;
+            }
+        }
+        self.editor.run_command(command, count, mods)
+    }
+
+    fn receive_char(&self, c: &str) {
+        self.editor.receive_char(c);
+    }
 }
 
 /// Extract the terminalId from a `tool_call_update`'s `content` array, if it
@@ -203,8 +256,8 @@ pub fn extract_content_text(update: &serde_json::Value) -> Option<String> {
 }
 
 impl ChatData {
-    pub fn new(cx: Scope, common: Rc<CommonData>) -> Self {
-        Self::new_with_id(cx, common, ChatId::next())
+    pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
+        Self::new_with_id(cx, editors, common, ChatId::next())
     }
 
     /// Build a chat with a specific id. Used when an `EditorTabChild::Chat(id)`
@@ -212,15 +265,19 @@ impl ChatData {
     /// up with that id for ACP routing.
     pub fn new_with_id(
         cx: Scope,
+        editors: Editors,
         common: Rc<CommonData>,
         chat_id: ChatId,
     ) -> Self {
+        // The input is a real editor backed by an in-memory local doc
+        // (same mechanism as the find/replace editors).
+        let input_editor = editors.make_local(cx, common.clone());
         Self {
             chat_id,
             blocks: cx.create_rw_signal(Vec::new()),
             session_id: cx.create_rw_signal(None),
             is_loading: cx.create_rw_signal(false),
-            input: cx.create_rw_signal(String::new()),
+            input_editor,
             scroll_version: cx.create_rw_signal(0),
             next_id: Rc::new(Cell::new(1)),
             scope: cx,
@@ -426,7 +483,13 @@ impl ChatData {
 
     /// Send the current input as a prompt to the ACP agent.
     pub fn send_prompt(&self) {
-        let text = self.input.get_untracked().trim().to_string();
+        let text = self
+            .input_editor
+            .doc()
+            .buffer
+            .with(|b| b.to_string())
+            .trim()
+            .to_string();
         if text.is_empty() {
             return;
         }
@@ -434,7 +497,8 @@ impl ChatData {
         // Instant feedback, exactly like the reference store: show the user
         // message immediately, before any round-trip.
         self.push_block(self.user_block(text.clone()));
-        self.input.update(|s| s.clear());
+        // Clear the input editor.
+        self.input_editor.doc().reload(Rope::from(""), true);
         self.is_loading.set(true);
 
         if let Some(session_id) = self.session_id.get_untracked() {
