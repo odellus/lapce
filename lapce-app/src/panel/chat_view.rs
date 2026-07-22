@@ -17,6 +17,7 @@ use floem::{
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     chat::{ChatBlock, ChatData, ToolStatus},
+    command::LapceWorkbenchCommand,
     config::color::LapceColor,
     markdown::{MarkdownContent, parse_markdown},
     window_tab::{Focus, WindowTabData},
@@ -26,8 +27,18 @@ pub fn chat_panel(
     window_tab_data: Rc<WindowTabData>,
     _position: PanelPosition,
 ) -> impl View {
-    let config = window_tab_data.common.config;
     let chat = window_tab_data.chat.clone();
+    chat_view(chat, window_tab_data)
+}
+
+/// Render a single chat instance. Used both by the chat panel (the
+/// `window_tab_data.chat` singleton) and by editor-tab chats (each their own
+/// `ChatData`).
+pub fn chat_view(
+    chat: ChatData,
+    window_tab_data: Rc<WindowTabData>,
+) -> impl View {
+    let config = window_tab_data.common.config;
     let focus = window_tab_data.common.focus;
     let is_loading = chat.is_loading;
     let scroll_version = chat.scroll_version;
@@ -45,6 +56,38 @@ pub fn chat_panel(
     let chat_for_stack = chat.clone();
 
     stack((
+        // Header row — "+ New Chat" opens an independent chat as an editor tab.
+        {
+            let workbench_command = window_tab_data.common.workbench_command;
+            container(
+                label(|| "+ New Chat".to_string())
+                    .on_click_stop(move |_| {
+                        workbench_command
+                            .send(LapceWorkbenchCommand::NewChatTab);
+                    })
+                    .style(move |s| {
+                        let config = config.get();
+                        s.padding_horiz(10.0)
+                            .padding_vert(4.0)
+                            .items_center()
+                            .justify_center()
+                            .border(1.0)
+                            .border_radius(6.0)
+                            .font_size(12.0)
+                            .cursor(CursorStyle::Pointer)
+                            .selectable(false)
+                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                            .hover(|s| {
+                                s.background(
+                                    config
+                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                )
+                            })
+                    }),
+            )
+            .style(|s| s.width_pct(100.0).justify_end().padding(8.0))
+        },
         // Message list — one continuous scroll, no borders between blocks
         container({
             scroll({

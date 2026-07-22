@@ -24,6 +24,10 @@ key = "meta+,"
 command = "open_settings"
 
 [[keymaps]]
+key = "meta+shift+i"
+command = "new_chat_tab"
+
+[[keymaps]]
 key = "meta+k meta+s"
 command = "open_keyboard_shortcuts"
 

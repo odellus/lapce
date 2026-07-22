@@ -241,6 +241,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "Open Settings")]
     OpenSettings,
 
+    #[strum(serialize = "new_chat_tab")]
+    #[strum(message = "New Chat Tab")]
+    NewChatTab,
+
     #[strum(serialize = "open_settings_file")]
     #[strum(message = "Open Settings File")]
     OpenSettingsFile,

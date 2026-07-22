@@ -181,6 +181,15 @@ pub struct WindowTabData {
     pub code_lens: RwSignal<Option<ViewId>>,
     pub source_control: SourceControlData,
     pub chat: ChatData,
+    /// Editor-tab chat instances, keyed by ChatId. The panel chat lives in
+    /// `self.chat`; chats opened as editor tabs are registered here.
+    pub chats: Rc<std::cell::RefCell<std::collections::HashMap<crate::id::ChatId, ChatData>>>,
+    /// session_id → owning ChatId, for routing `AcpSessionUpdate` and
+    /// terminal notifications to the right chat.
+    session_chat: Rc<std::cell::RefCell<std::collections::HashMap<String, crate::id::ChatId>>>,
+    /// create-token (raw chat_id) → owning ChatId, for routing
+    /// `AcpSessionCreated`/`Failed` back to the chat that asked for it.
+    token_chat: Rc<std::cell::RefCell<std::collections::HashMap<u64, crate::id::ChatId>>>,
     pub typst_view: floem_typst::TypstView,
     pub typst_source: RwSignal<String>,
     pub notes: crate::notes::NotesData,
@@ -565,6 +574,9 @@ impl WindowTabData {
             code_lens: cx.create_rw_signal(None),
             source_control,
             chat,
+            chats: Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            session_chat: Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            token_chat: Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             typst_view,
             typst_source,
             notes,
@@ -914,6 +926,14 @@ impl WindowTabData {
             // ==== Configuration / Info Files and Folders ====
             OpenSettings => {
                 self.main_split.open_settings();
+            }
+            NewChatTab => {
+                // A fresh, independent chat instance (its own ACP session),
+                // opened as an editor tab so several chats can run at once.
+                let chat = ChatData::new(self.scope, self.common.clone());
+                self.register_chat(chat.clone());
+                chat.ensure_session();
+                self.main_split.open_chat_tab(chat.chat_id);
             }
             OpenSettingsFile => {
                 if let Some(path) = LapceConfig::settings_file() {
@@ -2151,6 +2171,43 @@ impl WindowTabData {
         }
     }
 
+    /// Register an editor-tab chat so ACP notifications route to it. Records
+    /// the create-token → chat mapping so the forthcoming `AcpSessionCreated`
+    /// finds its owner. (The panel chat is `self.chat` and is never
+    /// registered — unknown tokens/sessions fall back to it.)
+    pub fn register_chat(&self, chat: ChatData) {
+        let token = chat.chat_id.to_raw();
+        self.token_chat.borrow_mut().insert(token, chat.chat_id);
+        self.chats.borrow_mut().insert(chat.chat_id, chat);
+    }
+
+    /// Get the editor-tab chat for `id`, creating + registering it (and
+    /// requesting its ACP session) on demand. Idempotent. Used by the
+    /// editor-tab view builder and the workspace-restore path.
+    pub fn editor_chat(&self, id: crate::id::ChatId) -> ChatData {
+        if let Some(chat) = self.chats.borrow().get(&id) {
+            return chat.clone();
+        }
+        let chat = ChatData::new_with_id(self.scope, self.common.clone(), id);
+        self.register_chat(chat.clone());
+        chat.ensure_session();
+        chat
+    }
+
+    /// The chat that owns a create-token, or the panel chat if unregistered.
+    fn chat_for_token(&self, token: u64) -> ChatData {
+        let id = self.token_chat.borrow().get(&token).copied();
+        id.and_then(|id| self.chats.borrow().get(&id).cloned())
+            .unwrap_or_else(|| self.chat.clone())
+    }
+
+    /// The chat that owns an ACP session, or the panel chat if unmapped.
+    fn chat_for_session(&self, session_id: &str) -> ChatData {
+        let id = self.session_chat.borrow().get(session_id).copied();
+        id.and_then(|id| self.chats.borrow().get(&id).cloned())
+            .unwrap_or_else(|| self.chat.clone())
+    }
+
     fn handle_core_notification(&self, rpc: &CoreNotification) {
         let cx = self.scope;
         match rpc {
@@ -2397,30 +2454,41 @@ impl WindowTabData {
                 self.file_explorer.reload();
             }
             // ── ACP ──────────────────────────────────────────────────
-            CoreNotification::AcpSessionCreated { session_id } => {
-                self.chat.handle_session_created(session_id.clone());
+            CoreNotification::AcpSessionCreated { session_id, chat_id } => {
+                let chat = self.chat_for_token(*chat_id);
+                // Remember which chat owns this session for later updates.
+                self.session_chat
+                    .borrow_mut()
+                    .insert(session_id.clone(), chat.chat_id);
+                chat.handle_session_created(session_id.clone());
             }
-            CoreNotification::AcpSessionFailed { error } => {
-                self.chat.handle_session_failed(error.clone());
+            CoreNotification::AcpSessionFailed { error, chat_id } => {
+                self.chat_for_token(*chat_id)
+                    .handle_session_failed(error.clone());
             }
-            CoreNotification::AcpSessionUpdate { update, .. } => {
-                self.chat.handle_session_update(update.clone());
+            CoreNotification::AcpSessionUpdate { session_id, update } => {
+                self.chat_for_session(session_id)
+                    .handle_session_update(update.clone());
             }
-            CoreNotification::AcpDisconnected { .. } => {
-                self.chat.handle_disconnected();
+            CoreNotification::AcpDisconnected { session_id } => {
+                self.chat_for_session(session_id).handle_disconnected();
             }
             CoreNotification::AcpTerminalData {
                 terminal_id,
+                session_id,
                 data,
             } => {
-                self.chat.handle_terminal_data(&terminal_id, &data);
+                self.chat_for_session(session_id)
+                    .handle_terminal_data(&terminal_id, &data);
             }
             CoreNotification::AcpTerminalExit {
                 terminal_id,
+                session_id,
                 ..
             } => {
                 // Trigger a final repaint so the grid shows the last state.
-                self.chat.handle_terminal_data(&terminal_id, b"");
+                self.chat_for_session(session_id)
+                    .handle_terminal_data(&terminal_id, b"");
             }
             _ => {}
         }

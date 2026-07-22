@@ -360,6 +360,10 @@ pub enum ProxyNotification {
         args: Vec<String>,
         env: Vec<String>,
         cwd: String,
+        /// Client-supplied correlation token echoed back in
+        /// `AcpSessionCreated`/`AcpSessionFailed` so the right chat claims
+        /// the new session.
+        chat_id: u64,
     },
     /// Send a prompt to an ACP session.
     AcpPrompt {
@@ -1248,5 +1252,33 @@ impl ProxyRpcHandler {
 impl Default for ProxyRpcHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The create-session request must carry the client's correlation
+    /// token so the proxy can echo it back to the right chat instance.
+    #[test]
+    fn acp_create_session_carries_chat_id() {
+        let n = ProxyNotification::AcpCreateSession {
+            agent_name: "crow-cli".to_string(),
+            command: "crow-cli".to_string(),
+            args: vec!["acp".to_string()],
+            env: vec![],
+            cwd: "/proj".to_string(),
+            chat_id: 99,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["method"], "acp_create_session");
+        assert_eq!(v["params"]["chat_id"], 99);
+        assert_eq!(v["params"]["cwd"], "/proj");
+        let back: ProxyNotification = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ProxyNotification::AcpCreateSession { chat_id, .. } if chat_id == 99
+        ));
     }
 }

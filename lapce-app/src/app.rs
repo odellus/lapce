@@ -1407,6 +1407,14 @@ fn editor_tab_content(
             EditorTabChild::Volt(_, id) => {
                 plugin_info_view(plugin.clone(), id).into_any()
             }
+            EditorTabChild::Chat(chat_id) => {
+                let chat = window_tab_data.editor_chat(chat_id);
+                crate::panel::chat_view::chat_view(
+                    chat,
+                    window_tab_data.clone(),
+                )
+                .into_any()
+            }
         };
         child.style(|s| s.size_full())
     };

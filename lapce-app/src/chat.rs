@@ -5,8 +5,12 @@ use std::sync::{Arc, RwLock};
 
 use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate};
 use lapce_rpc::proxy::ProxyNotification;
+use lapce_xi_rope::Rope;
 
 use crate::chat_terminal::{ChatRawTerminal, ChatTermHandle};
+use crate::editor::EditorData;
+use crate::id::ChatId;
+use crate::main_split::Editors;
 use crate::window_tab::CommonData;
 
 /// Status of a tool call.
@@ -92,6 +96,10 @@ impl ChatBlock {
 /// Data model for the ACP chat panel.
 #[derive(Clone)]
 pub struct ChatData {
+    /// Stable identity for this chat instance. Echoed to the proxy in
+    /// `AcpCreateSession` and back in `AcpSessionCreated`/`Failed` so the
+    /// right chat claims its session when several run at once.
+    pub chat_id: ChatId,
     /// Ordered list of display blocks.
     pub blocks: RwSignal<Vec<ChatBlock>>,
     /// Current ACP session ID.
@@ -196,7 +204,19 @@ pub fn extract_content_text(update: &serde_json::Value) -> Option<String> {
 
 impl ChatData {
     pub fn new(cx: Scope, common: Rc<CommonData>) -> Self {
+        Self::new_with_id(cx, common, ChatId::next())
+    }
+
+    /// Build a chat with a specific id. Used when an `EditorTabChild::Chat(id)`
+    /// already exists (e.g. workspace restore) and the `ChatData` must line
+    /// up with that id for ACP routing.
+    pub fn new_with_id(
+        cx: Scope,
+        common: Rc<CommonData>,
+        chat_id: ChatId,
+    ) -> Self {
         Self {
+            chat_id,
             blocks: cx.create_rw_signal(Vec::new()),
             session_id: cx.create_rw_signal(None),
             is_loading: cx.create_rw_signal(false),
@@ -235,6 +255,7 @@ impl ChatData {
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default(),
+                chat_id: self.chat_id.to_raw(),
             });
     }
 

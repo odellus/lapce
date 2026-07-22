@@ -147,13 +147,18 @@ pub enum CoreNotification {
         breakpoints: Vec<dap_types::Breakpoint>,
     },
     // ── ACP (Agent Client Protocol) ──────────────────────────────────
-    /// A new ACP session was created successfully.
+    /// A new ACP session was created successfully. `chat_id` echoes the
+    /// token the client sent in `AcpCreateSession` so the right chat instance
+    /// (panel or an editor-tab chat) can claim the new session.
     AcpSessionCreated {
         session_id: String,
+        chat_id: u64,
     },
-    /// ACP session creation failed.
+    /// ACP session creation failed. `chat_id` routes the error to the chat
+    /// that requested the session.
     AcpSessionFailed {
         error: String,
+        chat_id: u64,
     },
     /// Streaming session update from an ACP agent.
     AcpSessionUpdate {
@@ -165,13 +170,16 @@ pub enum CoreNotification {
         session_id: String,
     },
     /// Raw bytes from an ACP client-side terminal (for inline chat rendering).
+    /// `session_id` routes the bytes to the chat that owns this terminal.
     AcpTerminalData {
         terminal_id: String,
+        session_id: String,
         data: Vec<u8>,
     },
     /// An ACP client-side terminal process exited.
     AcpTerminalExit {
         terminal_id: String,
+        session_id: String,
         exit_code: Option<i32>,
     },
 }
@@ -395,16 +403,28 @@ impl CoreRpcHandler {
         self.notification(CoreNotification::UpdateTerminal { term_id, content });
     }
 
-    pub fn acp_terminal_data(&self, terminal_id: String, data: Vec<u8>) {
+    pub fn acp_terminal_data(
+        &self,
+        terminal_id: String,
+        session_id: String,
+        data: Vec<u8>,
+    ) {
         self.notification(CoreNotification::AcpTerminalData {
             terminal_id,
+            session_id,
             data,
         });
     }
 
-    pub fn acp_terminal_exit(&self, terminal_id: String, exit_code: Option<i32>) {
+    pub fn acp_terminal_exit(
+        &self,
+        terminal_id: String,
+        session_id: String,
+        exit_code: Option<i32>,
+    ) {
         self.notification(CoreNotification::AcpTerminalExit {
             terminal_id,
+            session_id,
             exit_code,
         });
     }
@@ -471,5 +491,65 @@ pub struct ServerStatusParams {
 impl ServerStatusParams {
     pub fn is_ok(&self) -> bool {
         self.health.as_str() == "ok"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Multi-chat routing hinges on these notifications carrying their
+    /// correlation fields across the proxy↔app wire. Guard the exact shape.
+    #[test]
+    fn acp_session_created_carries_chat_id() {
+        let n = CoreNotification::AcpSessionCreated {
+            session_id: "sess-1".to_string(),
+            chat_id: 42,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["method"], "acp_session_created");
+        assert_eq!(v["params"]["session_id"], "sess-1");
+        assert_eq!(v["params"]["chat_id"], 42);
+        let back: CoreNotification = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            CoreNotification::AcpSessionCreated { session_id, chat_id }
+                if session_id == "sess-1" && chat_id == 42
+        ));
+    }
+
+    #[test]
+    fn acp_session_failed_carries_chat_id() {
+        let v = serde_json::to_value(CoreNotification::AcpSessionFailed {
+            error: "boom".to_string(),
+            chat_id: 7,
+        })
+        .unwrap();
+        assert_eq!(v["method"], "acp_session_failed");
+        assert_eq!(v["params"]["chat_id"], 7);
+        assert_eq!(v["params"]["error"], "boom");
+    }
+
+    #[test]
+    fn acp_terminal_notifs_carry_session_id() {
+        let data = serde_json::to_value(CoreNotification::AcpTerminalData {
+            terminal_id: "t1".to_string(),
+            session_id: "sess-9".to_string(),
+            data: vec![104, 105],
+        })
+        .unwrap();
+        assert_eq!(data["method"], "acp_terminal_data");
+        assert_eq!(data["params"]["terminal_id"], "t1");
+        assert_eq!(data["params"]["session_id"], "sess-9");
+
+        let exit = serde_json::to_value(CoreNotification::AcpTerminalExit {
+            terminal_id: "t1".to_string(),
+            session_id: "sess-9".to_string(),
+            exit_code: Some(0),
+        })
+        .unwrap();
+        assert_eq!(exit["method"], "acp_terminal_exit");
+        assert_eq!(exit["params"]["session_id"], "sess-9");
+        assert_eq!(exit["params"]["exit_code"], 0);
     }
 }

@@ -420,6 +420,7 @@ impl ProxyHandler for Dispatcher {
                 args,
                 env,
                 cwd,
+                chat_id,
             } => {
                 tracing::info!(
                     agent = %agent_name,
@@ -491,7 +492,10 @@ impl ProxyHandler for Dispatcher {
                         let session_id = session.session_id();
                         tracing::info!(session = %session_id, "ACP: session created, notifying core");
                         self.core_rpc.notification(
-                            CoreNotification::AcpSessionCreated { session_id },
+                            CoreNotification::AcpSessionCreated {
+                                session_id,
+                                chat_id,
+                            },
                         );
                     }
                     Err(e) => {
@@ -499,6 +503,7 @@ impl ProxyHandler for Dispatcher {
                         self.core_rpc.notification(
                             CoreNotification::AcpSessionFailed {
                                 error: format!("{}", e),
+                                chat_id,
                             },
                         );
                     }
@@ -1553,22 +1558,25 @@ impl Dispatcher {
 
                         let core_rpc = self.core_rpc.clone();
                         let tid = terminal_id.clone();
+                        let sid = session_id.to_string();
                         thread::Builder::new()
                             .name(format!("acp-term-{tid}"))
                             .spawn(move || {
                                 let core_rpc2 = core_rpc.clone();
                                 let tid2 = tid.clone();
+                                let sid2 = sid.clone();
                                 let code = crate::acp::pty::run_acp_pty(
                                     pty,
                                     term,
                                     move |bytes| {
                                         core_rpc2.acp_terminal_data(
                                             tid2.clone(),
+                                            sid2.clone(),
                                             bytes.to_vec(),
                                         );
                                     },
                                 );
-                                core_rpc.acp_terminal_exit(tid, code);
+                                core_rpc.acp_terminal_exit(tid, sid, code);
                             })
                             .ok();
 
