@@ -3,7 +3,8 @@ use std::sync::atomic::AtomicU64;
 
 use floem::{
     AnyView, IntoView, View,
-    event::EventListener,
+    event::{Event, EventListener},
+    peniko::kurbo::Point,
     reactive::{RwSignal, SignalGet, SignalUpdate, create_memo, create_rw_signal},
     style::CursorStyle,
     text::Style as FontStyle,
@@ -170,12 +171,60 @@ pub fn chat_view(
                 };
                 f == Focus::Panel(PanelKind::Chat)
             };
+            // Drag handle above the editor: drag up = taller input.
+            // Mirrors lapce's split-divider drag (app.rs): request_active
+            // on PointerDown keeps PointerMove firing while the cursor
+            // leaves the thin handle.
+            let input_height = chat.input_height;
+            let drag_start: RwSignal<Option<(Point, f64)>> =
+                create_rw_signal(None);
+            let handle = empty();
+            let handle_id = handle.id();
+            let drag_handle = handle
+                .on_event_stop(EventListener::PointerDown, move |event| {
+                    handle_id.request_active();
+                    if let Event::PointerDown(pointer_event) = event {
+                        drag_start.set(Some((
+                            pointer_event.pos,
+                            input_height.get_untracked(),
+                        )));
+                    }
+                })
+                .on_event_stop(EventListener::PointerUp, move |_| {
+                    drag_start.set(None);
+                })
+                .on_event_stop(EventListener::PointerMove, move |event| {
+                    if let Event::PointerMove(pointer_event) = event {
+                        if let Some((start_pt, start_h)) =
+                            drag_start.get_untracked()
+                        {
+                            // Dragging up (smaller y) grows the input.
+                            let new_h = start_h + (start_pt.y - pointer_event.pos.y);
+                            input_height.set(new_h.clamp(80.0, 600.0));
+                        }
+                    }
+                })
+                .style(move |s| {
+                    let config = config.get();
+                    let is_dragging = drag_start.get().is_some();
+                    s.width_pct(100.0)
+                        .height(5.0)
+                        .margin_bottom(2.0)
+                        .cursor(CursorStyle::RowResize)
+                        .apply_if(is_dragging, |s| {
+                            s.background(config.color(LapceColor::EDITOR_CARET))
+                        })
+                        .hover(|s| {
+                            s.background(config.color(LapceColor::LAPCE_BORDER))
+                        })
+                });
             stack((
+                drag_handle,
                 container(editor_view(input_editor, debug_breakline, is_active))
                     .style(move |s| {
                         let config = config.get();
                         s.width_pct(100.0)
-                            .height(200.0)
+                            .height(input_height.get())
                             .border(1.0)
                             .border_radius(8.0)
                             .border_color(config.color(LapceColor::LAPCE_BORDER))

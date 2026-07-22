@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
@@ -8,6 +9,7 @@ use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith};
 use floem::views::editor::command::CommandExecuted;
 use lapce_core::command::EditCommand;
 use lapce_core::mode::Mode;
+use lapce_core::syntax::Syntax;
 use lapce_rpc::proxy::ProxyNotification;
 use lapce_xi_rope::Rope;
 
@@ -116,6 +118,9 @@ pub struct ChatData {
     /// in-memory local doc. Enter sends / Shift+Enter inserts a newline
     /// (handled by `ChatInputFocus` + the `Focus::Panel(Chat)` key route).
     pub input_editor: EditorData,
+    /// Height (px) of the input editor. Drag-resizable via the handle
+    /// above it; defaults to ~10 lines.
+    pub input_height: RwSignal<f64>,
     /// Monotonically increasing counter, bumped on every block mutation.
     /// The view watches this to trigger auto-scroll.
     pub scroll_version: RwSignal<u64>,
@@ -272,12 +277,20 @@ impl ChatData {
         // The input is a real editor backed by an in-memory local doc
         // (same mechanism as the find/replace editors).
         let input_editor = editors.make_local(cx, common.clone());
+        // Markdown syntax so fenced code blocks typed into the input are
+        // highlighted (same mechanism as opening a .md file).
+        {
+            let doc = input_editor.doc();
+            doc.set_syntax(Syntax::init(Path::new("chat.md")));
+            doc.trigger_syntax_change(None);
+        }
         Self {
             chat_id,
             blocks: cx.create_rw_signal(Vec::new()),
             session_id: cx.create_rw_signal(None),
             is_loading: cx.create_rw_signal(false),
             input_editor,
+            input_height: cx.create_rw_signal(200.0),
             scroll_version: cx.create_rw_signal(0),
             next_id: Rc::new(Cell::new(1)),
             scope: cx,

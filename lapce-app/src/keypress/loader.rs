@@ -250,4 +250,39 @@ command = "goto_definition"
             KeyMapKey::Logical(Key::Character("+".into()))
         );
     }
+
+    /// The chat input relies on the default keymaps binding BOTH `enter`
+    /// and `shift+enter` to `insert_new_line` (mode insert). ChatInputFocus
+    /// then intercepts `InsertNewLine`: bare Enter (no SHIFT mod) sends the
+    /// prompt, Shift+Enter delegates to the editor → newline. If either
+    /// binding disappears, Enter or Shift+Enter silently does nothing.
+    #[test]
+    fn enter_and_shift_enter_bind_insert_new_line() {
+        let mut loader = KeyMapLoader::new();
+        loader
+            .load_from_str(super::super::DEFAULT_KEYMAPS_COMMON, true)
+            .unwrap();
+        let (keymaps, _) = loader.finalize();
+
+        let has_insert_new_line = |key: &str| -> bool {
+            let keypress = KeyMapPress::parse(key);
+            keymaps
+                .get(&keypress)
+                .map(|bindings| {
+                    bindings
+                        .iter()
+                        .any(|k| k.command == "insert_new_line")
+                })
+                .unwrap_or(false)
+        };
+
+        assert!(
+            has_insert_new_line("enter"),
+            "`enter` must bind insert_new_line in the default keymaps"
+        );
+        assert!(
+            has_insert_new_line("shift+enter"),
+            "`shift+enter` must bind insert_new_line in the default keymaps"
+        );
+    }
 }
