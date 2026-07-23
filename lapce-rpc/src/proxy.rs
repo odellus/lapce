@@ -378,6 +378,34 @@ pub enum ProxyNotification {
     AcpCloseSession {
         session_id: String,
     },
+    /// Set a session config option on the agent (e.g. switch the model via
+    /// `session/set_config_option`). The refreshed options come back on the
+    /// normal `AcpSessionUpdate` channel as a `config_option_update`.
+    AcpSetConfigOption {
+        session_id: String,
+        config_id: String,
+        value: String,
+    },
+    /// List the agent's past sessions for the live session's cwd
+    /// (`session/list`). The result comes back as `AcpSessionList`.
+    AcpListSessions {
+        session_id: String,
+        chat_id: u64,
+    },
+    /// Resume an existing session: spawn a fresh agent connection bound to
+    /// `target_session_id` via `session/load`. The agent replays the session's
+    /// history as `session/update` notifications. The app pre-registers the
+    /// `target_session_id → chat_id` mapping before sending this so the
+    /// replayed updates route correctly.
+    AcpLoadSession {
+        chat_id: u64,
+        target_session_id: String,
+        agent_name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<String>,
+        cwd: String,
+    },
     /// ACP agent issued a client-tool request (fs/terminal). The session
     /// reader injects this into the dispatch loop so it runs with access to
     /// the open document model. There is no permission system — tools execute.

@@ -121,6 +121,17 @@ pub struct ChatData {
     pub blocks: RwSignal<Vec<ChatBlock>>,
     /// Current ACP session ID.
     pub session_id: RwSignal<Option<String>>,
+    /// Name of the ACP agent this chat uses (from settings `[acp]`). The
+    /// header's agent picker mutates this; switching agents tears down the
+    /// current session and re-creates one with the new agent.
+    pub agent_name: RwSignal<String>,
+    /// The agent's session config options (raw `SessionConfigOption[]` JSON),
+    /// e.g. the model selector. Fed from the `session/new` response, from
+    /// `config_option_update` session updates, and from `set_config_option`
+    /// responses. The header derives the model picker from this.
+    pub config_options: RwSignal<serde_json::Value>,
+    /// Past sessions for the history dropdown (fed by `AcpSessionList`).
+    pub sessions: RwSignal<Vec<HistorySession>>,
     /// Whether the agent is currently processing a prompt.
     pub is_loading: RwSignal<bool>,
     /// The chat input, a real (multi-line) lapce editor backed by an
@@ -449,6 +460,124 @@ pub fn is_read_tool(kind: Option<&str>, title: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// The model selector derived from a `SessionConfigOption[]` (the option whose
+/// `category == "model"` or `id == "model"`). Mirrors crow-ade's
+/// `acpChatEditor` conversion (`options.find(opt => opt.category === 'model' ||
+/// opt.id === 'model')` → map `options` to `{id: value, name}` + `currentValue`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSelect {
+    /// The `configId` to send back to `session/set_config_option`.
+    pub config_id: String,
+    /// The currently selected value id (`currentValue`).
+    pub current: String,
+    /// Selectable values as `(value, name)`, with grouped options flattened.
+    pub items: Vec<(String, String)>,
+}
+
+/// Parse the model selector out of a raw `SessionConfigOption[]` JSON value.
+/// Returns `None` if there is no model option or it has no `options` array.
+/// Handles both flat `[{name, value}]` and grouped `[{name, options:[…]}]`
+/// option lists (crow-ade only handles flat; we flatten groups too).
+pub fn parse_model_select(options: &serde_json::Value) -> Option<ModelSelect> {
+    let arr = options.as_array()?;
+    let opt = arr.iter().find(|o| {
+        let is_model = o.get("category").and_then(|v| v.as_str())
+            == Some("model")
+            || o.get("id").and_then(|v| v.as_str()) == Some("model");
+        is_model
+    })?;
+    let options_node = opt.get("options")?;
+    let mut items = Vec::new();
+    if let Some(list) = options_node.as_array() {
+        for el in list {
+            if let (Some(value), name) = (
+                el.get("value").and_then(|v| v.as_str()),
+                el.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            ) {
+                // Flat option.
+                items.push((value.to_string(), name.to_string()));
+            } else if let Some(group_opts) =
+                el.get("options").and_then(|g| g.as_array())
+            {
+                // Grouped option: flatten the inner values.
+                for inner in group_opts {
+                    if let (Some(value), name) = (
+                        inner.get("value").and_then(|v| v.as_str()),
+                        inner
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    ) {
+                        items.push((value.to_string(), name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    if !opt.get("options").map(|v| v.is_array()).unwrap_or(false) {
+        return None;
+    }
+    Some(ModelSelect {
+        config_id: opt
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("model")
+            .to_string(),
+        current: opt
+            .get("currentValue")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        items,
+    })
+}
+
+/// A past session row for the history dropdown, parsed from an ACP
+/// `SessionInfo` (`{ sessionId, cwd, title?, updatedAt? }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySession {
+    pub id: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Parse a `SessionInfo[]` JSON value into history rows, excluding `exclude`
+/// (the live session — no point offering to reload it). Tolerant of both
+/// camelCase (`sessionId`/`updatedAt`) and snake_case keys.
+pub fn parse_history_sessions(
+    sessions: &serde_json::Value,
+    exclude: Option<&str>,
+) -> Vec<HistorySession> {
+    let arr = match sessions.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|s| {
+            let id = s
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .or_else(|| s.get("id").and_then(|v| v.as_str()))?
+                .to_string();
+            if id.is_empty() || exclude == Some(id.as_str()) {
+                return None;
+            }
+            let title = s
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|t| !t.is_empty());
+            let updated_at = s
+                .get("updatedAt")
+                .and_then(|v| v.as_str())
+                .or_else(|| s.get("updated_at").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .filter(|t| !t.is_empty());
+            Some(HistorySession { id, title, updated_at })
+        })
+        .collect()
+}
+
 impl ChatData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         Self::new_with_id(cx, editors, common, ChatId::next())
@@ -473,10 +602,21 @@ impl ChatData {
             doc.set_syntax(Syntax::init(Path::new("chat.md")));
             doc.trigger_syntax_change(None);
         }
+        let initial_agent = common
+            .config
+            .get_untracked()
+            .acp
+            .selected_agent()
+            .name;
         Self {
             chat_id,
             blocks: cx.create_rw_signal(Vec::new()),
             session_id: cx.create_rw_signal(None),
+            agent_name: cx.create_rw_signal(initial_agent),
+            config_options: cx.create_rw_signal(serde_json::Value::Array(
+                Vec::new(),
+            )),
+            sessions: cx.create_rw_signal(Vec::new()),
             is_loading: cx.create_rw_signal(false),
             input_editor,
             input_height: cx.create_rw_signal(200.0),
@@ -500,22 +640,183 @@ impl ChatData {
             return;
         }
         self.session_requested.set(true);
-        self.common
-            .proxy
-            .notification(ProxyNotification::AcpCreateSession {
-                agent_name: "crow-cli".to_string(),
-                command: "crow-cli".to_string(),
-                args: vec!["acp".to_string()],
-                env: vec![],
-                cwd: self
-                    .common
+        // Resolve the agent for *this* chat: the per-chat selection (set by the
+        // header's agent picker, seeded from settings `[acp]`), looked up in the
+        // configured agent list so its command/args/env/cwd come from settings.
+        let agent = self.agent_config_for(&self.agent_name.get_untracked());
+        let cwd = agent
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                self.common
                     .workspace
                     .path
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+            });
+        tracing::info!(
+            agent = %agent.name,
+            command = %agent.command,
+            cwd = %cwd,
+            "chat: creating ACP session from configured agent"
+        );
+        self.common
+            .proxy
+            .notification(ProxyNotification::AcpCreateSession {
+                agent_name: agent.name,
+                command: agent.command,
+                args: agent.args,
+                env: agent.env,
+                cwd,
                 chat_id: self.chat_id.to_raw(),
             });
+    }
+
+    /// Resolve a configured agent by name (so its command/args/env/cwd come from
+    /// settings `[acp]`); if the name isn't listed, fall back to the configured
+    /// selection (which itself falls back to the built-in `crow-cli`).
+    fn agent_config_for(
+        &self,
+        name: &str,
+    ) -> crate::config::agent::AcpAgentConfig {
+        let acp = &self.common.config.get_untracked().acp;
+        acp.agents
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .unwrap_or_else(|| acp.selected_agent())
+    }
+
+    /// Switch this chat's agent (from the header picker). If a session is
+    /// already live, tear it down and re-create one with the new agent so the
+    /// change takes effect immediately (mirrors crow-ade's `onAgentChange` →
+    /// re-spawn). If no session exists yet, the new name is used on first send.
+    pub fn select_agent(&self, name: String) {
+        if name.is_empty() || name == self.agent_name.get_untracked() {
+            return;
+        }
+        tracing::info!(
+            from = %self.agent_name.get_untracked(),
+            to = %name,
+            "chat: switching agent"
+        );
+        self.agent_name.set(name);
+        if let Some(session_id) = self.session_id.get_untracked() {
+            self.common
+                .proxy
+                .notification(ProxyNotification::AcpCloseSession { session_id });
+            self.session_id.set(None);
+            self.session_requested.set(false);
+            self.ensure_session();
+        }
+    }
+
+    /// Store a fresh `SessionConfigOption[]` (only if it's actually an array —
+    /// guards against a malformed/missing payload clearing the picker).
+    pub fn set_config_options(&self, options: serde_json::Value) {
+        if options.is_array() {
+            self.config_options.set(options);
+        }
+    }
+
+    /// Ask the agent to set a session config option (e.g. switch the model).
+    /// The refreshed options arrive back on the update channel and are stored
+    /// by `handle_session_update`, which re-renders the picker.
+    pub fn select_config_option(&self, config_id: String, value: String) {
+        if let Some(session_id) = self.session_id.get_untracked() {
+            tracing::info!(
+                session = %session_id,
+                config_id = %config_id,
+                value = %value,
+                "chat: set_config_option"
+            );
+            self.common.proxy.notification(
+                ProxyNotification::AcpSetConfigOption {
+                    session_id,
+                    config_id,
+                    value,
+                },
+            );
+        }
+    }
+
+    /// Store the agent's list of past sessions (excluding the live one) for the
+    /// history dropdown.
+    pub fn handle_session_list(&self, sessions: serde_json::Value) {
+        let exclude = self.session_id.get_untracked();
+        self.sessions
+            .set(parse_history_sessions(&sessions, exclude.as_deref()));
+    }
+
+    /// Ask the agent for its past sessions (`session/list`), routed back via
+    /// `AcpSessionList`. No-op if there's no live session to ask through.
+    pub fn request_session_list(&self) {
+        if let Some(session_id) = self.session_id.get_untracked() {
+            self.common.proxy.notification(
+                ProxyNotification::AcpListSessions {
+                    session_id,
+                    chat_id: self.chat_id.to_raw(),
+                },
+            );
+        }
+    }
+
+    /// Resume `target`: close the live session, clear the transcript (the agent
+    /// replays it via `session/update` on load), reset session state, and ask
+    /// the proxy to spawn a connection bound to `target` via `session/load`.
+    /// The caller (`WindowTabData::load_chat_session`) MUST pre-register the
+    /// `target → chat` mapping before calling this, so the replayed updates
+    /// (which can arrive before `AcpSessionCreated`) route to this chat.
+    pub fn load_into(&self, target: String) {
+        let old = self.session_id.get_untracked();
+        // Clear transcript + per-tool terminals; the load replay rebuilds them.
+        self.blocks.set(Vec::new());
+        self.terminals.borrow_mut().clear();
+        self.session_id.set(None);
+        self.session_requested.set(false);
+        self.config_options
+            .set(serde_json::Value::Array(Vec::new()));
+        self.sessions.set(Vec::new());
+        if let Some(old) = old {
+            self.common.proxy.notification(
+                ProxyNotification::AcpCloseSession { session_id: old },
+            );
+        }
+        let agent = self.agent_config_for(&self.agent_name.get_untracked());
+        let cwd = agent
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                self.common
+                    .workspace
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+        tracing::info!(
+            target = %target,
+            agent = %agent.name,
+            "chat: loading (resuming) session"
+        );
+        self.common.proxy.notification(
+            ProxyNotification::AcpLoadSession {
+                chat_id: self.chat_id.to_raw(),
+                target_session_id: target,
+                agent_name: agent.name,
+                command: agent.command,
+                args: agent.args,
+                env: agent.env,
+                cwd,
+            },
+        );
     }
 
     fn new_id(&self) -> u64 {
@@ -738,8 +1039,15 @@ impl ChatData {
 
     /// Respond to a permission request (allow or deny a tool call).
     /// Handle AcpSessionCreated.
-    pub fn handle_session_created(&self, session_id: String) {
+    pub fn handle_session_created(
+        &self,
+        session_id: String,
+        config_options: serde_json::Value,
+    ) {
         self.session_id.set(Some(session_id.clone()));
+        // Seed the model picker from the `session/new` response (the agent may
+        // never push a `config_option_update`, so this is the only chance).
+        self.set_config_options(config_options);
         // Drain a prompt the user typed before the session was ready.
         if let Some(text) = self.pending_prompt.get_untracked() {
             self.pending_prompt.set(None);
@@ -770,6 +1078,13 @@ impl ChatData {
         // The proxy already normalizes to the inner `SessionUpdate`, but stay
         // tolerant of a full `{ sessionId, update }` envelope just in case.
         let update = update.get("update").cloned().unwrap_or(update);
+
+        // A `config_option_update` (or our synthetic one from a set) carries
+        // the full options list; store it so the model picker refreshes.
+        // Discriminant-agnostic: only config updates have a `configOptions` key.
+        if let Some(opts) = update.get("configOptions") {
+            self.set_config_options(opts.clone());
+        }
 
         let session_update = update
             .get("sessionUpdate")
@@ -1130,6 +1445,89 @@ mod tests {
         // Cursor reset to origin (offset 0), as send_prompt now does.
         b.edit(&[(Selection::caret(0), "x")], EditType::InsertChars);
         assert_eq!(b.to_string(), "x");
+    }
+
+    #[test]
+    fn parse_model_select_flat_and_grouped_and_current() {
+        use serde_json::json;
+        // Flat options + currentValue, matched by category:"model".
+        let opts = json!([
+            {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "provider:m2",
+                "options": [
+                    { "name": "Model One", "value": "provider:m1" },
+                    { "name": "Model Two", "value": "provider:m2" }
+                ]
+            }
+        ]);
+        let m = parse_model_select(&opts).unwrap();
+        assert_eq!(m.config_id, "model");
+        assert_eq!(m.current, "provider:m2");
+        assert_eq!(
+            m.items,
+            vec![
+                ("provider:m1".to_string(), "Model One".to_string()),
+                ("provider:m2".to_string(), "Model Two".to_string()),
+            ]
+        );
+
+        // Grouped options are flattened; matched by id:"model".
+        let opts = json!([
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "g:x",
+                "options": [
+                    { "group": "g", "name": "Group", "options": [
+                        { "name": "X", "value": "g:x" },
+                        { "name": "Y", "value": "g:y" }
+                    ] }
+                ]
+            }
+        ]);
+        let m = parse_model_select(&opts).unwrap();
+        assert_eq!(m.items.len(), 2);
+        assert_eq!(m.items[0].0, "g:x");
+
+        // No model option → None (picker hidden).
+        assert!(parse_model_select(&json!([
+            { "id": "mode", "name": "Mode", "category": "mode",
+              "type": "select", "currentValue": "a",
+              "options": [ { "name": "A", "value": "a" } ] }
+        ]))
+        .is_none());
+        // Not an array → None.
+        assert!(parse_model_select(&json!({})).is_none());
+    }
+
+    #[test]
+    fn parse_history_sessions_excludes_live_and_reads_fields() {
+        use serde_json::json;
+        let sessions = json!([
+            { "sessionId": "live", "cwd": "/x", "title": "Current", "updatedAt": "2026-07-22T00:00:00Z" },
+            { "sessionId": "old-1", "cwd": "/x", "title": "Hello", "updatedAt": "2026-07-21T00:00:00Z" },
+            { "sessionId": "old-2", "cwd": "/x", "title": "", "updatedAt": null },
+            { "sessionId": "", "cwd": "/x" }
+        ]);
+        let rows = parse_history_sessions(&sessions, Some("live"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "old-1");
+        assert_eq!(rows[0].title.as_deref(), Some("Hello"));
+        assert_eq!(
+            rows[0].updated_at.as_deref(),
+            Some("2026-07-21T00:00:00Z")
+        );
+        // Empty title → None; null updated_at → None; empty id dropped.
+        assert_eq!(rows[1].id, "old-2");
+        assert!(rows[1].title.is_none());
+        assert!(rows[1].updated_at.is_none());
+        // Not an array → empty.
+        assert!(parse_history_sessions(&json!({}), None).is_empty());
     }
 
     #[test]

@@ -434,80 +434,63 @@ impl ProxyHandler for Dispatcher {
                     args,
                     env,
                 };
-                let cwd = if cwd.is_empty() {
-                    self.workspace
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                } else {
-                    cwd
-                };
-
-                let (event_tx, event_rx) =
-                    crossbeam_channel::unbounded::<SessionEvent>();
-
-                // Forward session events → CoreNotification.
-                let core_rpc = self.core_rpc.clone();
-                thread::Builder::new()
-                    .name("acp-event-fwd".to_string())
-                    .spawn(move || {
-                        while let Ok(event) = event_rx.recv() {
-                            match event {
-                                SessionEvent::Update {
-                                    session_id,
-                                    update,
-                                } => {
-                                    core_rpc.notification(
-                                        CoreNotification::AcpSessionUpdate {
-                                            session_id,
-                                            update,
-                                        },
-                                    );
-                                }
-                                SessionEvent::Disconnected { session_id } => {
-                                    core_rpc.notification(
-                                        CoreNotification::AcpDisconnected {
-                                            session_id,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    })
-                    .ok();
-
-                // Client-tool requests (fs/terminal) are injected back into
-                // this loop as `AcpClientTool` notifications (see the session
-                // reader) and handled below with `&mut self` — against the
-                // open document model. No detached thread, no permission UI.
-
-                match self.acp_manager.create_session(
+                start_acp_session(
+                    &self.acp_manager,
+                    &self.core_rpc,
+                    &self.proxy_rpc,
+                    &self.workspace,
                     config,
-                    &cwd,
-                    vec![],
-                    event_tx,
-                    self.proxy_rpc.clone(),
-                ) {
-                    Ok(session) => {
-                        let session_id = session.session_id();
-                        tracing::info!(session = %session_id, "ACP: session created, notifying core");
-                        self.core_rpc.notification(
-                            CoreNotification::AcpSessionCreated {
-                                session_id,
-                                chat_id,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "ACP: session creation failed, notifying core");
-                        self.core_rpc.notification(
-                            CoreNotification::AcpSessionFailed {
-                                error: format!("{}", e),
-                                chat_id,
-                            },
-                        );
-                    }
-                }
+                    cwd,
+                    chat_id,
+                    None,
+                );
+            }
+            AcpLoadSession {
+                agent_name,
+                command,
+                args,
+                env,
+                cwd,
+                chat_id,
+                target_session_id,
+            } => {
+                tracing::info!(
+                    agent = %agent_name,
+                    target = %target_session_id,
+                    cwd = %cwd,
+                    "ACP: received load (resume) session request"
+                );
+                let config = AgentConfig {
+                    name: agent_name,
+                    command,
+                    args,
+                    env,
+                };
+                start_acp_session(
+                    &self.acp_manager,
+                    &self.core_rpc,
+                    &self.proxy_rpc,
+                    &self.workspace,
+                    config,
+                    cwd,
+                    chat_id,
+                    Some(target_session_id),
+                );
+            }
+            AcpListSessions { session_id, chat_id } => {
+                tracing::info!(session = %session_id, "ACP: list sessions");
+                let sessions = self
+                    .acp_manager
+                    .get_session(&session_id)
+                    .and_then(|s| {
+                        let cwd = s.cwd();
+                        s.list_sessions(&cwd).ok()
+                    })
+                    .and_then(|v| v.get("sessions").cloned())
+                    .unwrap_or_else(|| serde_json::json!([]));
+                self.core_rpc.notification(
+                    CoreNotification::AcpSessionList { chat_id, sessions },
+                );
             }
             AcpPrompt {
                 session_id,
@@ -527,6 +510,43 @@ impl ProxyHandler for Dispatcher {
             }
             AcpCloseSession { session_id } => {
                 self.acp_manager.close_session(&session_id);
+            }
+            AcpSetConfigOption {
+                session_id,
+                config_id,
+                value,
+            } => {
+                tracing::info!(
+                    session = %session_id,
+                    config_id = %config_id,
+                    value = %value,
+                    "ACP: set_config_option"
+                );
+                if let Some(session) = self.acp_manager.get_session(&session_id) {
+                    match session.set_config_option(&config_id, &value) {
+                        Ok(opts) => {
+                            // Reuse the update channel: a synthetic
+                            // `config_option_update` so the app's existing
+                            // `handle_session_update` stores the refreshed
+                            // options (same path as an agent-pushed update).
+                            self.core_rpc.notification(
+                                CoreNotification::AcpSessionUpdate {
+                                    session_id,
+                                    update: serde_json::json!({
+                                        "sessionUpdate": "config_option_update",
+                                        "configOptions": opts,
+                                    }),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "ACP: set_config_option failed"
+                            );
+                        }
+                    }
+                }
             }
             AcpClientTool {
                 session_id,
@@ -1342,6 +1362,100 @@ impl ProxyHandler for Dispatcher {
                 let resp = ProxyResponse::ReferencesResolveResponse { items };
                 self.proxy_rpc.handle_response(id, Ok(resp));
             }
+        }
+    }
+}
+
+/// Spawn an ACP agent connection and either start a fresh session
+/// (`load_session_id = None` → `session/new`) or resume an existing one
+/// (`Some(id)` → `session/load`). Shared by the create and load notification
+/// arms so the event-forwarder thread + success/failure notifications stay
+/// identical. On a resume, the agent replays the session's history as
+/// `session/update` notifications, which the forwarder relays verbatim.
+fn start_acp_session(
+    acp_manager: &AcpSessionManager,
+    core_rpc: &CoreRpcHandler,
+    proxy_rpc: &ProxyRpcHandler,
+    workspace: &Option<PathBuf>,
+    config: AgentConfig,
+    cwd: String,
+    chat_id: u64,
+    load_session_id: Option<String>,
+) {
+    let cwd = if cwd.is_empty() {
+        workspace
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        cwd
+    };
+
+    let (event_tx, event_rx) =
+        crossbeam_channel::unbounded::<SessionEvent>();
+
+    // Forward session events → CoreNotification.
+    let core_rpc_fwd = core_rpc.clone();
+    thread::Builder::new()
+        .name("acp-event-fwd".to_string())
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                match event {
+                    SessionEvent::Update {
+                        session_id,
+                        update,
+                    } => {
+                        core_rpc_fwd.notification(
+                            CoreNotification::AcpSessionUpdate {
+                                session_id,
+                                update,
+                            },
+                        );
+                    }
+                    SessionEvent::Disconnected { session_id } => {
+                        core_rpc_fwd.notification(
+                            CoreNotification::AcpDisconnected { session_id },
+                        );
+                    }
+                }
+            }
+        })
+        .ok();
+
+    // Client-tool requests (fs/terminal) are injected back into the dispatch
+    // loop as `AcpClientTool` notifications (see the session reader) and run
+    // against the open document model. No detached thread, no permission UI.
+
+    match acp_manager.create_session(
+        config,
+        &cwd,
+        vec![],
+        event_tx,
+        proxy_rpc.clone(),
+        load_session_id,
+    ) {
+        Ok(session) => {
+            let session_id = session.session_id();
+            let config_options = session.config_options();
+            tracing::info!(
+                session = %session_id,
+                "ACP: session ready, notifying core"
+            );
+            core_rpc.notification(CoreNotification::AcpSessionCreated {
+                session_id,
+                chat_id,
+                config_options,
+            });
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "ACP: session start failed, notifying core"
+            );
+            core_rpc.notification(CoreNotification::AcpSessionFailed {
+                error: format!("{}", e),
+                chat_id,
+            });
         }
     }
 }

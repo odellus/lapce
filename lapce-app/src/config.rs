@@ -18,6 +18,7 @@ use strum::VariantNames;
 use tracing::error;
 
 use self::{
+    agent::AcpConfig,
     color::LapceColor,
     color_theme::{ColorThemeConfig, ThemeColor, ThemeColorPreference},
     core::CoreConfig,
@@ -30,6 +31,7 @@ use self::{
 };
 use crate::workspace::{LapceWorkspace, LapceWorkspaceType};
 
+pub mod agent;
 pub mod color;
 pub mod color_theme;
 pub mod core;
@@ -100,6 +102,11 @@ pub struct LapceConfig {
     pub ui: UIConfig,
     pub editor: EditorConfig,
     pub terminal: TerminalConfig,
+    /// ACP agent-server configuration (`[acp]`): the list of configured agents
+    /// and the default one to spawn. `#[serde(default)]` so a settings file with
+    /// no `[acp]` section falls back to the built-in `crow-cli acp` agent.
+    #[serde(default)]
+    pub acp: AcpConfig,
     #[serde(default)]
     pub color_theme: ColorThemeConfig,
     #[serde(default)]

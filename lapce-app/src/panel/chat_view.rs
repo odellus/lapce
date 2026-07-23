@@ -24,7 +24,7 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     chat::{
         ChatBlock, ChatData, ChatDiffLineKind, ToolStatus, diff_lines,
-        extract_file_path,
+        extract_file_path, parse_model_select,
     },
     command::{InternalCommand, LapceWorkbenchCommand},
     config::color::LapceColor,
@@ -79,24 +79,112 @@ pub fn chat_view(
     let chat_for_stack = chat.clone();
 
     let view = stack((
-        // Header row — "+ New Chat" opens an independent chat as an editor tab.
+        // Header — session id (left, with a status dot) + agent picker + the
+        // "+ New Chat" button (right). Mirrors crow-ade's `chatHeader`
+        // (session id top-left) and surfaces the configured ACP agents so the
+        // user can switch without editing settings.toml + restarting.
         {
             let workbench_command = window_tab_data.common.workbench_command;
-            container(
-                label(|| "+ New Chat".to_string())
+            let session_id_sig = chat.session_id;
+            let agent_name_sig = chat.agent_name;
+            let agent_open = create_rw_signal(false);
+            // Agent list is read once at build; lapce settings aren't hot
+            // reloaded, so a restart is required to change the list anyway.
+            let agents: Vec<String> = config
+                .get_untracked()
+                .acp
+                .agents
+                .iter()
+                .map(|a| a.name.clone())
+                .collect();
+            let chat_for_agents = chat.clone();
+            let config_options_sig = chat.config_options;
+            let model_open = create_rw_signal(false);
+            let chat_for_model = chat.clone();
+            let sessions_sig = chat.sessions;
+            let history_open = create_rw_signal(false);
+            let chat_for_hist = chat.clone();
+            let chat_for_hist_req = chat.clone();
+            let wtd_for_hist = window_tab_data.clone();
+            stack((
+                // Row 1: session id (left) ............ + New Chat (right)
+                stack((
+                    stack((
+                        // Status dot: green when a session is connected.
+                        container(empty()).style(move |s| {
+                            let connected = session_id_sig.get().is_some();
+                            s.size(8.0, 8.0).border_radius(4.0).background(
+                                if connected {
+                                    Color::from_rgba8(0x4e, 0xc2, 0x4e, 255)
+                                } else {
+                                    Color::from_rgba8(0x80, 0x80, 0x80, 255)
+                                },
+                            )
+                        }),
+                        label(move || {
+                            session_id_sig
+                                .get()
+                                .unwrap_or_else(|| "No session".to_string())
+                        })
+                        .style(|s| {
+                            s.font_size(11.0)
+                                .margin_left(6.0)
+                                .selectable(true)
+                                .color(Color::from_rgba8(0x9a, 0x9a, 0x9a, 255))
+                        }),
+                    ))
+                    .style(|s| s.flex_row().items_center()),
+                    empty().style(|s| s.flex_grow(1.0)),
+                    label(|| "+ New Chat".to_string())
+                        .on_click_stop(move |_| {
+                            workbench_command
+                                .send(LapceWorkbenchCommand::NewChatTab);
+                        })
+                        .style(move |s| {
+                            let config = config.get();
+                            s.padding_horiz(10.0)
+                                .padding_vert(4.0)
+                                .items_center()
+                                .justify_center()
+                                .border(1.0)
+                                .border_radius(6.0)
+                                .font_size(12.0)
+                                .cursor(CursorStyle::Pointer)
+                                .selectable(false)
+                                .color(
+                                    config.color(LapceColor::EDITOR_FOREGROUND),
+                                )
+                                .border_color(
+                                    config.color(LapceColor::LAPCE_BORDER),
+                                )
+                                .hover(|s| {
+                                    s.background(
+                                        config.color(
+                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                        ),
+                                    )
+                                })
+                        }),
+                ))
+                .style(|s| {
+                    s.flex_row().items_center().width_pct(100.0)
+                }),
+                // Row 2: agent picker trigger + (when open) the agent list.
+                stack((
+                    label(move || {
+                        format!("agent: {} ▾", agent_name_sig.get())
+                    })
                     .on_click_stop(move |_| {
-                        workbench_command
-                            .send(LapceWorkbenchCommand::NewChatTab);
+                        agent_open.update(|o| *o = !*o);
                     })
                     .style(move |s| {
                         let config = config.get();
-                        s.padding_horiz(10.0)
-                            .padding_vert(4.0)
-                            .items_center()
-                            .justify_center()
+                        s.padding_horiz(8.0)
+                            .padding_vert(3.0)
+                            .margin_top(6.0)
                             .border(1.0)
                             .border_radius(6.0)
-                            .font_size(12.0)
+                            .font_size(11.0)
                             .cursor(CursorStyle::Pointer)
                             .selectable(false)
                             .color(config.color(LapceColor::EDITOR_FOREGROUND))
@@ -108,8 +196,292 @@ pub fn chat_view(
                                 )
                             })
                     }),
-            )
-            .style(|s| s.width_pct(100.0).justify_end().padding(8.0))
+                    // Inline-expanding list (hidden when closed so it takes no
+                    // space). Each row selects that agent and closes the list.
+                    dyn_stack(
+                        move || agents.clone(),
+                        |name| name.clone(),
+                        move |name| {
+                            let chat_sel = chat_for_agents.clone();
+                            let click_name = name.clone();
+                            let style_name = name.clone();
+                            label(move || name.clone())
+                                .on_click_stop(move |_| {
+                                    chat_sel.select_agent(click_name.clone());
+                                    agent_open.set(false);
+                                })
+                                .style(move |s| {
+                                    let config = config.get();
+                                    let active =
+                                        agent_name_sig.get() == style_name;
+                                    s.width_pct(100.0)
+                                        .padding_horiz(8.0)
+                                        .padding_vert(3.0)
+                                        .font_size(11.0)
+                                        .cursor(CursorStyle::Pointer)
+                                        .selectable(false)
+                                        .color(config.color(
+                                            LapceColor::EDITOR_FOREGROUND,
+                                        ))
+                                        .background(if active {
+                                            config.color(
+                                                LapceColor::PANEL_HOVERED_BACKGROUND,
+                                            )
+                                        } else {
+                                            config.color(
+                                                LapceColor::EDITOR_BACKGROUND,
+                                            )
+                                        })
+                                        .hover(|s| {
+                                            s.background(config.color(
+                                                LapceColor::PANEL_HOVERED_BACKGROUND,
+                                            ))
+                                        })
+                                })
+                        },
+                    )
+                    .style(move |s| {
+                        s.flex_col()
+                            .width_pct(100.0)
+                            .margin_top(2.0)
+                            .border(1.0)
+                            .border_radius(6.0)
+                            .apply_if(!agent_open.get(), |s| s.hide())
+                    }),
+                    // Model picker trigger — only shown when the agent
+                    // advertises a model `SessionConfigOption`. Reads the
+                    // current value reactively from `config_options`.
+                    label(move || {
+                        let sel = parse_model_select(&config_options_sig.get());
+                        match sel {
+                            Some(m) => {
+                                let name = m
+                                    .items
+                                    .iter()
+                                    .find(|(v, _)| *v == m.current)
+                                    .map(|(_, n)| n.clone())
+                                    .unwrap_or_else(|| m.current.clone());
+                                format!(
+                                    "model: {} ▾",
+                                    if name.is_empty() {
+                                        "(default)".to_string()
+                                    } else {
+                                        name
+                                    }
+                                )
+                            }
+                            None => String::new(),
+                        }
+                    })
+                    .on_click_stop(move |_| {
+                        model_open.update(|o| *o = !*o);
+                    })
+                    .style(move |s| {
+                        let config = config.get();
+                        let hidden =
+                            parse_model_select(&config_options_sig.get())
+                                .is_none();
+                        s.padding_horiz(8.0)
+                            .padding_vert(3.0)
+                            .margin_top(6.0)
+                            .border(1.0)
+                            .border_radius(6.0)
+                            .font_size(11.0)
+                            .cursor(CursorStyle::Pointer)
+                            .selectable(false)
+                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                            .hover(|s| {
+                                s.background(
+                                    config
+                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                )
+                            })
+                            .apply_if(hidden, |s| s.hide())
+                    }),
+                    // Model list (hidden when closed or when no model option).
+                    dyn_stack(
+                        move || {
+                            parse_model_select(&config_options_sig.get())
+                                .map(|m| {
+                                    let cid = m.config_id;
+                                    let cur = m.current;
+                                    m.items
+                                        .into_iter()
+                                        .map(|(v, n)| (cid.clone(), cur.clone(), v, n))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        },
+                        |row| row.2.clone(),
+                        move |row| {
+                            let chat_sel = chat_for_model.clone();
+                            let (cid, cur, value, name) = row.clone();
+                            let style_cur = cur.clone();
+                            let style_value = value.clone();
+                            label(move || name.clone())
+                                .on_click_stop(move |_| {
+                                    chat_sel.select_config_option(
+                                        cid.clone(),
+                                        value.clone(),
+                                    );
+                                    model_open.set(false);
+                                })
+                                .style(move |s| {
+                                    let config = config.get();
+                                    let open = model_open.get();
+                                    let no_model = parse_model_select(
+                                        &config_options_sig.get(),
+                                    )
+                                    .is_none();
+                                    let active = style_value == style_cur;
+                                    s.width_pct(100.0)
+                                        .padding_horiz(8.0)
+                                        .padding_vert(3.0)
+                                        .font_size(11.0)
+                                        .cursor(CursorStyle::Pointer)
+                                        .selectable(false)
+                                        .color(config.color(
+                                            LapceColor::EDITOR_FOREGROUND,
+                                        ))
+                                        .background(if active {
+                                            config.color(
+                                                LapceColor::PANEL_HOVERED_BACKGROUND,
+                                            )
+                                        } else {
+                                            config.color(
+                                                LapceColor::EDITOR_BACKGROUND,
+                                            )
+                                        })
+                                        .hover(|s| {
+                                            s.background(config.color(
+                                                LapceColor::PANEL_HOVERED_BACKGROUND,
+                                            ))
+                                        })
+                                        .apply_if(!open || no_model, |s| {
+                                            s.hide()
+                                        })
+                                })
+                        },
+                    )
+                    .style(|s| s.flex_col().width_pct(100.0)),
+                    // History trigger — fetches the agent's past sessions on
+                    // open and inline-expands them; selecting one resumes it.
+                    label(move || {
+                        format!("history ▾ ({})", sessions_sig.get().len())
+                    })
+                    .on_click_stop(move |_| {
+                        let opening = !history_open.get_untracked();
+                        history_open.set(opening);
+                        if opening {
+                            chat_for_hist_req.request_session_list();
+                        }
+                    })
+                    .style(move |s| {
+                        let config = config.get();
+                        s.padding_horiz(8.0)
+                            .padding_vert(3.0)
+                            .margin_top(6.0)
+                            .border(1.0)
+                            .border_radius(6.0)
+                            .font_size(11.0)
+                            .cursor(CursorStyle::Pointer)
+                            .selectable(false)
+                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                            .hover(|s| {
+                                s.background(
+                                    config
+                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                )
+                            })
+                    }),
+                    // History list (hidden when closed). Each row resumes that
+                    // session via window_tab (which pre-registers the mapping).
+                    dyn_stack(
+                        move || sessions_sig.get(),
+                        |row| row.id.clone(),
+                        move |row| {
+                            let wtd2 = wtd_for_hist.clone();
+                            let chat_id = chat_for_hist.chat_id;
+                            let click_id = row.id.clone();
+                            let main: String = row
+                                .title
+                                .clone()
+                                .filter(|t| t != "Untitled Chat")
+                                .unwrap_or_else(|| {
+                                    let id = &row.id;
+                                    if id.len() > 16 {
+                                        format!("{}…", &id[..12])
+                                    } else {
+                                        id.clone()
+                                    }
+                                });
+                            let has_sub = row.updated_at.is_some();
+                            let sub_raw =
+                                row.updated_at.clone().unwrap_or_default();
+                            let sub_text = if sub_raw.len() >= 10 {
+                                sub_raw[..10].to_string()
+                            } else {
+                                sub_raw
+                            };
+                            stack((
+                                label(move || main.clone()).style(move |s| {
+                                    let config = config.get();
+                                    s.width_pct(100.0)
+                                        .font_size(11.0)
+                                        .selectable(false)
+                                        .color(config.color(
+                                            LapceColor::EDITOR_FOREGROUND,
+                                        ))
+                                }),
+                                label(move || sub_text.clone()).style(
+                                    move |s| {
+                                        let config = config.get();
+                                        s.width_pct(100.0)
+                                            .font_size(10.0)
+                                            .selectable(false)
+                                            .color(config.color(
+                                                LapceColor::EDITOR_DIM,
+                                            ))
+                                            .apply_if(!has_sub, |s| s.hide())
+                                    },
+                                ),
+                            ))
+                            .on_click_stop(move |_| {
+                                wtd2.load_chat_session(chat_id, click_id.clone());
+                                history_open.set(false);
+                            })
+                            .style(move |s| {
+                                let config = config.get();
+                                s.flex_col()
+                                    .width_pct(100.0)
+                                    .padding_horiz(8.0)
+                                    .padding_vert(3.0)
+                                    .cursor(CursorStyle::Pointer)
+                                    .hover(|s| {
+                                        s.background(config.color(
+                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                        ))
+                                    })
+                                    .apply_if(!history_open.get(), |s| {
+                                        s.hide()
+                                    })
+                            })
+                        },
+                    )
+                    .style(|s| s.flex_col().width_pct(100.0)),
+                ))
+                .style(|s| s.flex_col().items_start().width_pct(100.0)),
+            ))
+            .style(move |s| {
+                let config = config.get();
+                s.flex_col()
+                    .width_pct(100.0)
+                    .padding(8.0)
+                    .border_bottom(1.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+            })
         },
         // Message list — one continuous scroll, no borders between blocks.
         // 16px padding insets every block (markdown, tool fixtures) from the
@@ -126,6 +498,15 @@ pub fn chat_view(
                 .style(|s| s.flex_col().width_pct(100.0).padding(16.0))
             })
             .scroll_to(move || scroll_target.get())
+            // Absorb the wheel even at the scroll extremes so the chat scroll
+            // "takes control" instead of leaking to the outer workbench scroll
+            // (mirrors crow-ade's wheel stopPropagation on its message list).
+            // floem's scroll view only stops the wheel when it actually moves;
+            // with the default `propagate_pointer_wheel = true` the wheel leaks
+            // to the parent at the top/bottom, scrolling the whole IDE. The
+            // setting lives on `ScrollCustomStyle`, applied via `.scroll_style`
+            // (same pattern lapce uses for `.hide_bars`).
+            .scroll_style(|s| s.propagate_pointer_wheel(false))
             .style(|s| s.absolute().size_pct(100.0, 100.0))
         })
         .style(|s| s.size_pct(100.0, 100.0).flex_grow(1.0).flex_basis(0.0)),

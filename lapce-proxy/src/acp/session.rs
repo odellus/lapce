@@ -38,6 +38,10 @@ pub struct AcpSession {
     pub agent_id: String,
     /// The ACP session ID (set after session/new or session/load).
     session_id: Mutex<Option<String>>,
+    /// The agent's session config options (e.g. the model selector), last seen
+    /// in a `session/new`/`session/load`/`session/set_config_option` response or
+    /// a `config_option_update`. Exposed so the UI can render a model picker.
+    config_options: Mutex<Option<Value>>,
     /// Agent config (for re-spawning on session switch).
     pub agent_config: AgentConfig,
     /// Send JSON-RPC messages to the agent.
@@ -82,6 +86,7 @@ impl AcpSession {
             connection_id: connection_id.clone(),
             agent_id: agent_id.clone(),
             session_id: Mutex::new(None),
+            config_options: Mutex::new(None),
             agent_config: config,
             agent_manager: agent_manager.clone(),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -110,6 +115,44 @@ impl AcpSession {
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.connection_id.clone())
+    }
+
+    /// The working directory this session was created with (advertised at
+    /// `session/new`/`session/load`). Used to list sessions for the same cwd.
+    pub fn cwd(&self) -> String {
+        self.cwd.clone()
+    }
+
+    /// The last-seen session config options (e.g. the model selector), as a
+    /// JSON array (empty array if the agent never advertised any).
+    pub fn config_options(&self) -> Value {
+        self.config_options
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| json!([]))
+    }
+
+    /// Send `session/set_config_option` (e.g. switch the model). Returns the
+    /// refreshed `configOptions` array from the response (empty array if the
+    /// agent omitted it) and caches it. Mirrors crow-acp's `set_config_option`.
+    pub fn set_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Value> {
+        let params = json!({
+            "sessionId": self.session_id(),
+            "configId": config_id,
+            "value": value,
+        });
+        let resp = self.request("session/set_config_option", params)?;
+        let opts = resp
+            .get("configOptions")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        *self.config_options.lock().unwrap() = Some(opts.clone());
+        Ok(opts)
     }
 
     /// Send the ACP `initialize` request.
@@ -147,6 +190,8 @@ impl AcpSession {
         if let Some(sid) = resp.get("sessionId").and_then(|v| v.as_str()) {
             *self.session_id.lock().unwrap() = Some(sid.to_string());
         }
+        *self.config_options.lock().unwrap() =
+            resp.get("configOptions").cloned();
         Ok(resp)
     }
 
@@ -158,6 +203,8 @@ impl AcpSession {
         });
         let resp = self.request("session/load", params)?;
         *self.session_id.lock().unwrap() = Some(target_session_id.to_string());
+        *self.config_options.lock().unwrap() =
+            resp.get("configOptions").cloned();
         Ok(resp)
     }
 
@@ -439,10 +486,12 @@ impl AcpSessionManager {
         mcp_servers: Vec<Value>,
         event_tx: Sender<SessionEvent>,
         proxy_rpc: ProxyRpcHandler,
+        load_session_id: Option<String>,
     ) -> Result<Arc<AcpSession>> {
         tracing::info!(
             agent = %config.name,
             cwd = %cwd,
+            load = ?load_session_id,
             "ACP: creating session"
         );
         let session = AcpSession::spawn(
@@ -454,10 +503,22 @@ impl AcpSessionManager {
         )?;
         tracing::info!(conn = %session.connection_id, "ACP: sending initialize");
         session.initialize()?;
-        tracing::info!(conn = %session.connection_id, "ACP: sending session/new");
-        session.new_session(mcp_servers)?;
+        match load_session_id {
+            Some(target) => {
+                tracing::info!(
+                    conn = %session.connection_id,
+                    target = %target,
+                    "ACP: sending session/load (resume)"
+                );
+                session.load_session(&target, cwd)?;
+            }
+            None => {
+                tracing::info!(conn = %session.connection_id, "ACP: sending session/new");
+                session.new_session(mcp_servers)?;
+            }
+        }
         let session_id = session.session_id();
-        tracing::info!(session = %session_id, "ACP: session created");
+        tracing::info!(session = %session_id, "ACP: session ready");
         self.sessions
             .lock()
             .unwrap()

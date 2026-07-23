@@ -2214,6 +2214,39 @@ impl WindowTabData {
             .unwrap_or_else(|| self.chat.clone())
     }
 
+    /// Look up a registered chat by id without creating one (unlike
+    /// `editor_chat`). Used by the history dropdown to orchestrate a resume.
+    fn chat_by_id(&self, id: crate::id::ChatId) -> Option<ChatData> {
+        self.chats.borrow().get(&id).cloned()
+    }
+
+    /// Resume session `target` in the given chat. Pre-registers the
+    /// `target → chat` mapping (and drops the old session's mapping) *before*
+    /// the load request goes out, so the history the agent replays as
+    /// `session/update` notifications routes to this chat even if it arrives
+    /// before `AcpSessionCreated`.
+    pub fn load_chat_session(
+        &self,
+        chat_id: crate::id::ChatId,
+        target: String,
+    ) {
+        let Some(chat) = self.chat_by_id(chat_id) else {
+            return;
+        };
+        let old = chat.session_id.get_untracked();
+        if old.as_deref() == Some(target.as_str()) {
+            return; // already viewing this session
+        }
+        {
+            let mut map = self.session_chat.borrow_mut();
+            if let Some(o) = &old {
+                map.remove(o);
+            }
+            map.insert(target.clone(), chat_id);
+        }
+        chat.load_into(target);
+    }
+
     fn handle_core_notification(&self, rpc: &CoreNotification) {
         let cx = self.scope;
         match rpc {
@@ -2460,13 +2493,20 @@ impl WindowTabData {
                 self.file_explorer.reload();
             }
             // ── ACP ──────────────────────────────────────────────────
-            CoreNotification::AcpSessionCreated { session_id, chat_id } => {
+            CoreNotification::AcpSessionCreated {
+                session_id,
+                chat_id,
+                config_options,
+            } => {
                 let chat = self.chat_for_token(*chat_id);
                 // Remember which chat owns this session for later updates.
                 self.session_chat
                     .borrow_mut()
                     .insert(session_id.clone(), chat.chat_id);
-                chat.handle_session_created(session_id.clone());
+                chat.handle_session_created(
+                    session_id.clone(),
+                    config_options.clone(),
+                );
             }
             CoreNotification::AcpSessionFailed { error, chat_id } => {
                 self.chat_for_token(*chat_id)
@@ -2475,6 +2515,10 @@ impl WindowTabData {
             CoreNotification::AcpSessionUpdate { session_id, update } => {
                 self.chat_for_session(session_id)
                     .handle_session_update(update.clone());
+            }
+            CoreNotification::AcpSessionList { chat_id, sessions } => {
+                self.chat_for_token(*chat_id)
+                    .handle_session_list(sessions.clone());
             }
             CoreNotification::AcpDisconnected { session_id } => {
                 self.chat_for_session(session_id).handle_disconnected();

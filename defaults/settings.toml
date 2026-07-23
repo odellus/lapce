@@ -85,6 +85,20 @@ default = {}
 # environment = { "KEY" = "VALUE" }
 # workdir     = "/home/user"
 
+# ACP agent servers for the chat panel. `default-agent` names the entry in
+# `agents` to spawn for a new chat; each agent is a command + args/env and an
+# optional working directory (defaults to the workspace root). The built-in
+# default (used when this section is absent) is a single `crow-cli acp` agent.
+# [acp]
+# default-agent = "crow-cli"
+#
+# [[acp.agents]]
+# name    = "crow-cli"
+# command = "crow-cli"
+# args    = ["acp"]
+# env     = []
+# # cwd   = "/home/user/project"
+
 [ui]
 scale = +1.0
 font-family = ""

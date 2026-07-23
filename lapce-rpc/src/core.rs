@@ -153,6 +153,10 @@ pub enum CoreNotification {
     AcpSessionCreated {
         session_id: String,
         chat_id: u64,
+        /// The agent's session config options (e.g. model selector) from the
+        /// `session/new` response, so the UI can render a model picker before
+        /// any `config_option_update` arrives. Empty array if none.
+        config_options: serde_json::Value,
     },
     /// ACP session creation failed. `chat_id` routes the error to the chat
     /// that requested the session.
@@ -164,6 +168,13 @@ pub enum CoreNotification {
     AcpSessionUpdate {
         session_id: String,
         update: serde_json::Value,
+    },
+    /// The agent's list of past sessions (`session/list`), routed to the chat
+    /// that requested it via `chat_id`. `sessions` is the raw `SessionInfo[]`
+    /// array (`[{ sessionId, cwd, title?, updatedAt? }]`).
+    AcpSessionList {
+        chat_id: u64,
+        sessions: serde_json::Value,
     },
     /// An ACP session's agent process disconnected.
     AcpDisconnected {
@@ -505,16 +516,38 @@ mod tests {
         let n = CoreNotification::AcpSessionCreated {
             session_id: "sess-1".to_string(),
             chat_id: 42,
+            config_options: serde_json::json!([]),
         };
         let v = serde_json::to_value(&n).unwrap();
         assert_eq!(v["method"], "acp_session_created");
         assert_eq!(v["params"]["session_id"], "sess-1");
         assert_eq!(v["params"]["chat_id"], 42);
+        assert_eq!(v["params"]["config_options"], serde_json::json!([]));
         let back: CoreNotification = serde_json::from_value(v).unwrap();
         assert!(matches!(
             back,
-            CoreNotification::AcpSessionCreated { session_id, chat_id }
+            CoreNotification::AcpSessionCreated { session_id, chat_id, .. }
                 if session_id == "sess-1" && chat_id == 42
+        ));
+    }
+
+    #[test]
+    fn acp_session_list_carries_chat_id_and_sessions() {
+        let sessions = serde_json::json!([
+            { "sessionId": "old-1", "cwd": "/x", "title": "Hi", "updatedAt": "2026-07-22T00:00:00Z" }
+        ]);
+        let n = CoreNotification::AcpSessionList {
+            chat_id: 7,
+            sessions: sessions.clone(),
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["method"], "acp_session_list");
+        assert_eq!(v["params"]["chat_id"], 7);
+        assert_eq!(v["params"]["sessions"], sessions);
+        let back: CoreNotification = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            CoreNotification::AcpSessionList { chat_id, .. } if chat_id == 7
         ));
     }
 
