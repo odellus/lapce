@@ -26,7 +26,7 @@ use crate::{
         ChatBlock, ChatData, ChatDiffLineKind, ToolStatus, diff_lines,
         extract_file_path, parse_model_select,
     },
-    command::{InternalCommand, LapceWorkbenchCommand},
+    command::InternalCommand,
     config::color::LapceColor,
     editor::view::editor_view,
     editor_tab::EditorTabChild,
@@ -43,6 +43,18 @@ use crate::{
 pub enum ChatViewKind {
     Panel,
     EditorTab(crate::id::ChatId),
+}
+
+/// Which chat dropdown popup is currently open (at most one at a time). The
+/// agent/model/history lists are rendered as absolute overlays (see the
+/// dropdown overlay in `chat_view`) so opening one never pushes the
+/// surrounding layout — the history list in particular is a scrollable modal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatDropdown {
+    None,
+    Agent,
+    Model,
+    History,
 }
 
 pub fn chat_panel(
@@ -78,37 +90,29 @@ pub fn chat_view(
 
     let chat_for_stack = chat.clone();
 
+    // Shared dropdown state: which popup (agent/model/history) is open. The
+    // lists render as absolute overlays so they never push the layout.
+    let dropdown: RwSignal<ChatDropdown> = create_rw_signal(ChatDropdown::None);
+    // Agent names read once at build (settings aren't hot-reloaded).
+    let agent_names: Vec<String> = config
+        .get_untracked()
+        .acp
+        .agents
+        .iter()
+        .map(|a| a.name.clone())
+        .collect();
+
     let view = stack((
-        // Header — session id (left, with a status dot) + agent picker + the
-        // "+ New Chat" button (right). Mirrors crow-ade's `chatHeader`
-        // (session id top-left) and surfaces the configured ACP agents so the
-        // user can switch without editing settings.toml + restarting.
+        // Header — status dot + session id (left) and the history trigger
+        // (right). The agent/model selectors live in the bottom toolbar; all
+        // dropdown lists render as overlays (see below) so they never push the
+        // layout.
         {
-            let workbench_command = window_tab_data.common.workbench_command;
             let session_id_sig = chat.session_id;
-            let agent_name_sig = chat.agent_name;
-            let agent_open = create_rw_signal(false);
-            // Agent list is read once at build; lapce settings aren't hot
-            // reloaded, so a restart is required to change the list anyway.
-            let agents: Vec<String> = config
-                .get_untracked()
-                .acp
-                .agents
-                .iter()
-                .map(|a| a.name.clone())
-                .collect();
-            let chat_for_agents = chat.clone();
-            let config_options_sig = chat.config_options;
-            let model_open = create_rw_signal(false);
-            let chat_for_model = chat.clone();
             let sessions_sig = chat.sessions;
-            let history_open = create_rw_signal(false);
-            let chat_for_hist = chat.clone();
             let chat_for_hist_req = chat.clone();
-            let wtd_for_hist = window_tab_data.clone();
+            // session id (left) ............ history trigger (right)
             stack((
-                // Row 1: session id (left) ............ + New Chat (right)
-                stack((
                     stack((
                         // Status dot: green when a session is connected.
                         container(empty()).style(move |s| {
@@ -135,256 +139,30 @@ pub fn chat_view(
                     ))
                     .style(|s| s.flex_row().items_center()),
                     empty().style(|s| s.flex_grow(1.0)),
-                    label(|| "+ New Chat".to_string())
-                        .on_click_stop(move |_| {
-                            workbench_command
-                                .send(LapceWorkbenchCommand::NewChatTab);
-                        })
-                        .style(move |s| {
-                            let config = config.get();
-                            s.padding_horiz(10.0)
-                                .padding_vert(4.0)
-                                .items_center()
-                                .justify_center()
-                                .border(1.0)
-                                .border_radius(6.0)
-                                .font_size(12.0)
-                                .cursor(CursorStyle::Pointer)
-                                .selectable(false)
-                                .color(
-                                    config.color(LapceColor::EDITOR_FOREGROUND),
-                                )
-                                .border_color(
-                                    config.color(LapceColor::LAPCE_BORDER),
-                                )
-                                .hover(|s| {
-                                    s.background(
-                                        config.color(
-                                            LapceColor::PANEL_HOVERED_BACKGROUND,
-                                        ),
-                                    )
-                                })
-                        }),
-                ))
-                .style(|s| {
-                    s.flex_row().items_center().width_pct(100.0)
-                }),
-                // Row 2: agent picker trigger + (when open) the agent list.
-                stack((
-                    label(move || {
-                        format!("agent: {} ▾", agent_name_sig.get())
-                    })
-                    .on_click_stop(move |_| {
-                        agent_open.update(|o| *o = !*o);
-                    })
-                    .style(move |s| {
-                        let config = config.get();
-                        s.padding_horiz(8.0)
-                            .padding_vert(3.0)
-                            .margin_top(6.0)
-                            .border(1.0)
-                            .border_radius(6.0)
-                            .font_size(11.0)
-                            .cursor(CursorStyle::Pointer)
-                            .selectable(false)
-                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                            .border_color(config.color(LapceColor::LAPCE_BORDER))
-                            .hover(|s| {
-                                s.background(
-                                    config
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                                )
-                            })
-                    }),
-                    // Inline-expanding list (hidden when closed so it takes no
-                    // space). Each row selects that agent and closes the list.
-                    dyn_stack(
-                        move || agents.clone(),
-                        |name| name.clone(),
-                        move |name| {
-                            let chat_sel = chat_for_agents.clone();
-                            let click_name = name.clone();
-                            let style_name = name.clone();
-                            label(move || name.clone())
-                                .on_click_stop(move |_| {
-                                    chat_sel.select_agent(click_name.clone());
-                                    agent_open.set(false);
-                                })
-                                .style(move |s| {
-                                    let config = config.get();
-                                    let active =
-                                        agent_name_sig.get() == style_name;
-                                    s.width_pct(100.0)
-                                        .padding_horiz(8.0)
-                                        .padding_vert(3.0)
-                                        .font_size(11.0)
-                                        .cursor(CursorStyle::Pointer)
-                                        .selectable(false)
-                                        .color(config.color(
-                                            LapceColor::EDITOR_FOREGROUND,
-                                        ))
-                                        .background(if active {
-                                            config.color(
-                                                LapceColor::PANEL_HOVERED_BACKGROUND,
-                                            )
-                                        } else {
-                                            config.color(
-                                                LapceColor::EDITOR_BACKGROUND,
-                                            )
-                                        })
-                                        .hover(|s| {
-                                            s.background(config.color(
-                                                LapceColor::PANEL_HOVERED_BACKGROUND,
-                                            ))
-                                        })
-                                })
-                        },
-                    )
-                    .style(move |s| {
-                        s.flex_col()
-                            .width_pct(100.0)
-                            .margin_top(2.0)
-                            .border(1.0)
-                            .border_radius(6.0)
-                            .apply_if(!agent_open.get(), |s| s.hide())
-                    }),
-                    // Model picker trigger — only shown when the agent
-                    // advertises a model `SessionConfigOption`. Reads the
-                    // current value reactively from `config_options`.
-                    label(move || {
-                        let sel = parse_model_select(&config_options_sig.get());
-                        match sel {
-                            Some(m) => {
-                                let name = m
-                                    .items
-                                    .iter()
-                                    .find(|(v, _)| *v == m.current)
-                                    .map(|(_, n)| n.clone())
-                                    .unwrap_or_else(|| m.current.clone());
-                                format!(
-                                    "model: {} ▾",
-                                    if name.is_empty() {
-                                        "(default)".to_string()
-                                    } else {
-                                        name
-                                    }
-                                )
-                            }
-                            None => String::new(),
-                        }
-                    })
-                    .on_click_stop(move |_| {
-                        model_open.update(|o| *o = !*o);
-                    })
-                    .style(move |s| {
-                        let config = config.get();
-                        let hidden =
-                            parse_model_select(&config_options_sig.get())
-                                .is_none();
-                        s.padding_horiz(8.0)
-                            .padding_vert(3.0)
-                            .margin_top(6.0)
-                            .border(1.0)
-                            .border_radius(6.0)
-                            .font_size(11.0)
-                            .cursor(CursorStyle::Pointer)
-                            .selectable(false)
-                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                            .border_color(config.color(LapceColor::LAPCE_BORDER))
-                            .hover(|s| {
-                                s.background(
-                                    config
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                                )
-                            })
-                            .apply_if(hidden, |s| s.hide())
-                    }),
-                    // Model list (hidden when closed or when no model option).
-                    dyn_stack(
-                        move || {
-                            parse_model_select(&config_options_sig.get())
-                                .map(|m| {
-                                    let cid = m.config_id;
-                                    let cur = m.current;
-                                    m.items
-                                        .into_iter()
-                                        .map(|(v, n)| (cid.clone(), cur.clone(), v, n))
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        },
-                        |row| row.2.clone(),
-                        move |row| {
-                            let chat_sel = chat_for_model.clone();
-                            let (cid, cur, value, name) = row.clone();
-                            let style_cur = cur.clone();
-                            let style_value = value.clone();
-                            label(move || name.clone())
-                                .on_click_stop(move |_| {
-                                    chat_sel.select_config_option(
-                                        cid.clone(),
-                                        value.clone(),
-                                    );
-                                    model_open.set(false);
-                                })
-                                .style(move |s| {
-                                    let config = config.get();
-                                    let open = model_open.get();
-                                    let no_model = parse_model_select(
-                                        &config_options_sig.get(),
-                                    )
-                                    .is_none();
-                                    let active = style_value == style_cur;
-                                    s.width_pct(100.0)
-                                        .padding_horiz(8.0)
-                                        .padding_vert(3.0)
-                                        .font_size(11.0)
-                                        .cursor(CursorStyle::Pointer)
-                                        .selectable(false)
-                                        .color(config.color(
-                                            LapceColor::EDITOR_FOREGROUND,
-                                        ))
-                                        .background(if active {
-                                            config.color(
-                                                LapceColor::PANEL_HOVERED_BACKGROUND,
-                                            )
-                                        } else {
-                                            config.color(
-                                                LapceColor::EDITOR_BACKGROUND,
-                                            )
-                                        })
-                                        .hover(|s| {
-                                            s.background(config.color(
-                                                LapceColor::PANEL_HOVERED_BACKGROUND,
-                                            ))
-                                        })
-                                        .apply_if(!open || no_model, |s| {
-                                            s.hide()
-                                        })
-                                })
-                        },
-                    )
-                    .style(|s| s.flex_col().width_pct(100.0)),
-                    // History trigger — fetches the agent's past sessions on
-                    // open and inline-expands them; selecting one resumes it.
                     label(move || {
                         format!("history ▾ ({})", sessions_sig.get().len())
                     })
                     .on_click_stop(move |_| {
-                        let opening = !history_open.get_untracked();
-                        history_open.set(opening);
+                        let opening =
+                            dropdown.get_untracked() != ChatDropdown::History;
+                        dropdown.set(if opening {
+                            ChatDropdown::History
+                        } else {
+                            ChatDropdown::None
+                        });
                         if opening {
                             chat_for_hist_req.request_session_list();
                         }
                     })
                     .style(move |s| {
                         let config = config.get();
-                        s.padding_horiz(8.0)
-                            .padding_vert(3.0)
-                            .margin_top(6.0)
+                        s.padding_horiz(10.0)
+                            .padding_vert(4.0)
+                            .items_center()
+                            .justify_center()
                             .border(1.0)
                             .border_radius(6.0)
-                            .font_size(11.0)
+                            .font_size(12.0)
                             .cursor(CursorStyle::Pointer)
                             .selectable(false)
                             .color(config.color(LapceColor::EDITOR_FOREGROUND))
@@ -396,92 +174,16 @@ pub fn chat_view(
                                 )
                             })
                     }),
-                    // History list (hidden when closed). Each row resumes that
-                    // session via window_tab (which pre-registers the mapping).
-                    dyn_stack(
-                        move || sessions_sig.get(),
-                        |row| row.id.clone(),
-                        move |row| {
-                            let wtd2 = wtd_for_hist.clone();
-                            let chat_id = chat_for_hist.chat_id;
-                            let click_id = row.id.clone();
-                            let main: String = row
-                                .title
-                                .clone()
-                                .filter(|t| t != "Untitled Chat")
-                                .unwrap_or_else(|| {
-                                    let id = &row.id;
-                                    if id.len() > 16 {
-                                        format!("{}…", &id[..12])
-                                    } else {
-                                        id.clone()
-                                    }
-                                });
-                            let has_sub = row.updated_at.is_some();
-                            let sub_raw =
-                                row.updated_at.clone().unwrap_or_default();
-                            let sub_text = if sub_raw.len() >= 10 {
-                                sub_raw[..10].to_string()
-                            } else {
-                                sub_raw
-                            };
-                            stack((
-                                label(move || main.clone()).style(move |s| {
-                                    let config = config.get();
-                                    s.width_pct(100.0)
-                                        .font_size(11.0)
-                                        .selectable(false)
-                                        .color(config.color(
-                                            LapceColor::EDITOR_FOREGROUND,
-                                        ))
-                                }),
-                                label(move || sub_text.clone()).style(
-                                    move |s| {
-                                        let config = config.get();
-                                        s.width_pct(100.0)
-                                            .font_size(10.0)
-                                            .selectable(false)
-                                            .color(config.color(
-                                                LapceColor::EDITOR_DIM,
-                                            ))
-                                            .apply_if(!has_sub, |s| s.hide())
-                                    },
-                                ),
-                            ))
-                            .on_click_stop(move |_| {
-                                wtd2.load_chat_session(chat_id, click_id.clone());
-                                history_open.set(false);
-                            })
-                            .style(move |s| {
-                                let config = config.get();
-                                s.flex_col()
-                                    .width_pct(100.0)
-                                    .padding_horiz(8.0)
-                                    .padding_vert(3.0)
-                                    .cursor(CursorStyle::Pointer)
-                                    .hover(|s| {
-                                        s.background(config.color(
-                                            LapceColor::PANEL_HOVERED_BACKGROUND,
-                                        ))
-                                    })
-                                    .apply_if(!history_open.get(), |s| {
-                                        s.hide()
-                                    })
-                            })
-                        },
-                    )
-                    .style(|s| s.flex_col().width_pct(100.0)),
                 ))
-                .style(|s| s.flex_col().items_start().width_pct(100.0)),
-            ))
-            .style(move |s| {
-                let config = config.get();
-                s.flex_col()
-                    .width_pct(100.0)
-                    .padding(8.0)
-                    .border_bottom(1.0)
-                    .border_color(config.color(LapceColor::LAPCE_BORDER))
-            })
+                .style(move |s| {
+                    let config = config.get();
+                    s.flex_row()
+                        .items_center()
+                        .width_pct(100.0)
+                        .padding(8.0)
+                        .border_bottom(1.0)
+                        .border_color(config.color(LapceColor::LAPCE_BORDER))
+                })
         },
         // Message list — one continuous scroll, no borders between blocks.
         // 16px padding insets every block (markdown, tool fixtures) from the
@@ -691,30 +393,144 @@ pub fn chat_view(
                             .padding_top(8.0)
                             .padding_bottom(4.0)
                     }),
-                label(|| "Send".to_string())
-                    .on_click_stop(move |_| {
-                        chat_for_click.send_prompt();
-                    })
-                    .style(move |s| {
-                        let config = config.get();
-                        s.margin_top(6.0)
-                            .padding_horiz(12.0)
-                            .padding_vert(6.0)
-                            .items_center()
-                            .justify_center()
-                            .border(1.0)
-                            .border_radius(6.0)
-                            .border_color(config.color(LapceColor::LAPCE_BORDER))
-                            .cursor(CursorStyle::Pointer)
-                            .selectable(false)
-                            .apply_if(chat.is_loading.get(), |s| s.hide())
-                            .hover(|s| {
-                                s.background(
-                                    config
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                // Bottom toolbar: agent selector (bottom-left), model selector
+                // (to its right), and the Send button pushed to the far right.
+                // The agent/model lists open as overlays (below), so these
+                // triggers only toggle the shared `dropdown` signal.
+                {
+                    let agent_name_sig = chat.agent_name;
+                    let config_options_sig = chat.config_options;
+                    let is_loading_sig = chat.is_loading;
+                    stack((
+                        // Agent selector (bottom-left).
+                        label(move || {
+                            format!("agent: {} ▾", agent_name_sig.get())
+                        })
+                        .on_click_stop(move |_| {
+                            let opening =
+                                dropdown.get_untracked() != ChatDropdown::Agent;
+                            dropdown.set(if opening {
+                                ChatDropdown::Agent
+                            } else {
+                                ChatDropdown::None
+                            });
+                        })
+                        .style(move |s| {
+                            let config = config.get();
+                            s.padding_horiz(8.0)
+                                .padding_vert(4.0)
+                                .border(1.0)
+                                .border_radius(6.0)
+                                .font_size(11.0)
+                                .cursor(CursorStyle::Pointer)
+                                .selectable(false)
+                                .color(
+                                    config.color(LapceColor::EDITOR_FOREGROUND),
                                 )
+                                .border_color(
+                                    config.color(LapceColor::LAPCE_BORDER),
+                                )
+                                .hover(|s| {
+                                    s.background(config.color(
+                                        LapceColor::PANEL_HOVERED_BACKGROUND,
+                                    ))
+                                })
+                        }),
+                        // Model selector (right of the agent). Hidden unless
+                        // the agent advertises a model option.
+                        label(move || {
+                            let sel =
+                                parse_model_select(&config_options_sig.get());
+                            match sel {
+                                Some(m) => {
+                                    let name = m
+                                        .items
+                                        .iter()
+                                        .find(|(v, _)| *v == m.current)
+                                        .map(|(_, n)| n.clone())
+                                        .unwrap_or_else(|| m.current.clone());
+                                    format!(
+                                        "model: {} ▾",
+                                        if name.is_empty() {
+                                            "(default)".to_string()
+                                        } else {
+                                            name
+                                        }
+                                    )
+                                }
+                                None => String::new(),
+                            }
+                        })
+                        .on_click_stop(move |_| {
+                            let opening =
+                                dropdown.get_untracked() != ChatDropdown::Model;
+                            dropdown.set(if opening {
+                                ChatDropdown::Model
+                            } else {
+                                ChatDropdown::None
+                            });
+                        })
+                        .style(move |s| {
+                            let config = config.get();
+                            let hidden =
+                                parse_model_select(&config_options_sig.get())
+                                    .is_none();
+                            s.margin_left(6.0)
+                                .padding_horiz(8.0)
+                                .padding_vert(4.0)
+                                .border(1.0)
+                                .border_radius(6.0)
+                                .font_size(11.0)
+                                .cursor(CursorStyle::Pointer)
+                                .selectable(false)
+                                .color(
+                                    config.color(LapceColor::EDITOR_FOREGROUND),
+                                )
+                                .border_color(
+                                    config.color(LapceColor::LAPCE_BORDER),
+                                )
+                                .hover(|s| {
+                                    s.background(config.color(
+                                        LapceColor::PANEL_HOVERED_BACKGROUND,
+                                    ))
+                                })
+                                .apply_if(hidden, |s| s.hide())
+                        }),
+                        // Spacer pushes the Send button to the far right.
+                        empty().style(|s| s.flex_grow(1.0)),
+                        // Send button (bottom-right).
+                        label(|| "Send".to_string())
+                            .on_click_stop(move |_| {
+                                chat_for_click.send_prompt();
                             })
-                    }),
+                            .style(move |s| {
+                                let config = config.get();
+                                s.padding_horiz(12.0)
+                                    .padding_vert(5.0)
+                                    .items_center()
+                                    .justify_center()
+                                    .border(1.0)
+                                    .border_radius(6.0)
+                                    .border_color(
+                                        config.color(LapceColor::LAPCE_BORDER),
+                                    )
+                                    .cursor(CursorStyle::Pointer)
+                                    .selectable(false)
+                                    .apply_if(is_loading_sig.get(), |s| s.hide())
+                                    .hover(|s| {
+                                        s.background(config.color(
+                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                        ))
+                                    })
+                            }),
+                    ))
+                    .style(|s| {
+                        s.flex_row()
+                            .items_center()
+                            .width_pct(100.0)
+                            .margin_top(6.0)
+                    })
+                },
             ))
             .style(|s| {
                 s.flex_col()
@@ -724,6 +540,354 @@ pub fn chat_view(
                     // input doesn't butt against the panel edge either.
                     .padding_horiz(16.0)
                     .padding_vert(12.0)
+            })
+        },
+        // Dropdown overlay — the agent/model/history lists render here as
+        // popups (mirrors lapce's `alert_box` modal pattern) so opening one
+        // never pushes the surrounding layout. A single absolute, full-panel
+        // layer hosts exactly the active list; clicking outside closes it.
+        // History is a centered, scrollable modal (most-recent-first); the
+        // agent/model lists open at the bottom-left, rising above the input
+        // toolbar.
+        {
+            let dropdown = dropdown;
+            let agent_name_sig = chat.agent_name;
+            let config_options_sig = chat.config_options;
+            let sessions_sig = chat.sessions;
+            let input_height = chat.input_height;
+            let agent_names = agent_names.clone();
+            let chat_for_agent = chat.clone();
+            let chat_for_model = chat.clone();
+            let wtd_for_hist = window_tab_data.clone();
+            let chat_id = chat.chat_id;
+
+            container(
+                dyn_stack(
+                    move || match dropdown.get() {
+                        ChatDropdown::None => Vec::new(),
+                        other => vec![other],
+                    },
+                    |kind| *kind as u8,
+                    move |kind| match kind {
+                        ChatDropdown::Agent => {
+                            let chat_sel = chat_for_agent.clone();
+                            let names = agent_names.clone();
+                            scroll(
+                                dyn_stack(
+                                    move || names.clone(),
+                                    |name| name.clone(),
+                                    move |name| {
+                                        let chat_sel = chat_sel.clone();
+                                        let click_name = name.clone();
+                                        let style_name = name.clone();
+                                        label(move || name.clone())
+                                            .on_click_stop(move |_| {
+                                                chat_sel.select_agent(
+                                                    click_name.clone(),
+                                                );
+                                                dropdown.set(ChatDropdown::None);
+                                            })
+                                            .style(move |s| {
+                                                let config = config.get();
+                                                let active = agent_name_sig.get()
+                                                    == style_name;
+                                                s.width_pct(100.0)
+                                                    .padding_horiz(10.0)
+                                                    .padding_vert(4.0)
+                                                    .font_size(11.0)
+                                                    .cursor(CursorStyle::Pointer)
+                                                    .selectable(false)
+                                                    .color(config.color(
+                                                        LapceColor::EDITOR_FOREGROUND,
+                                                    ))
+                                                    .background(if active {
+                                                        config.color(
+                                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                                        )
+                                                    } else {
+                                                        Color::TRANSPARENT
+                                                    })
+                                                    .hover(|s| {
+                                                        s.background(config.color(
+                                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                                        ))
+                                                    })
+                                            })
+                                    },
+                                )
+                                .style(|s| s.flex_col().min_width(160.0)),
+                            )
+                            .on_event_stop(EventListener::PointerDown, |_| {})
+                            .style(move |s| {
+                                let config = config.get();
+                                s.max_height(260.0)
+                                    .margin_left(16.0)
+                                    .margin_bottom(input_height.get() + 56.0)
+                                    .border(1.0)
+                                    .border_radius(6.0)
+                                    .border_color(
+                                        config.color(LapceColor::LAPCE_BORDER),
+                                    )
+                                    .background(
+                                        config.color(LapceColor::PANEL_BACKGROUND),
+                                    )
+                            })
+                            .into_any()
+                        }
+                        ChatDropdown::Model => {
+                            let chat_sel = chat_for_model.clone();
+                            scroll(
+                                dyn_stack(
+                                    move || {
+                                        parse_model_select(&config_options_sig.get())
+                                            .map(|m| {
+                                                let cid = m.config_id;
+                                                let cur = m.current;
+                                                m.items
+                                                    .into_iter()
+                                                    .map(|(v, n)| {
+                                                        (
+                                                            cid.clone(),
+                                                            cur.clone(),
+                                                            v,
+                                                            n,
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default()
+                                    },
+                                    |row| row.2.clone(),
+                                    move |row| {
+                                        let chat_sel = chat_sel.clone();
+                                        let (cid, cur, value, name) = row.clone();
+                                        let style_cur = cur.clone();
+                                        let style_value = value.clone();
+                                        label(move || name.clone())
+                                            .on_click_stop(move |_| {
+                                                chat_sel.select_config_option(
+                                                    cid.clone(),
+                                                    value.clone(),
+                                                );
+                                                dropdown.set(ChatDropdown::None);
+                                            })
+                                            .style(move |s| {
+                                                let config = config.get();
+                                                let active =
+                                                    style_value == style_cur;
+                                                s.width_pct(100.0)
+                                                    .padding_horiz(10.0)
+                                                    .padding_vert(4.0)
+                                                    .font_size(11.0)
+                                                    .cursor(CursorStyle::Pointer)
+                                                    .selectable(false)
+                                                    .color(config.color(
+                                                        LapceColor::EDITOR_FOREGROUND,
+                                                    ))
+                                                    .background(if active {
+                                                        config.color(
+                                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                                        )
+                                                    } else {
+                                                        Color::TRANSPARENT
+                                                    })
+                                                    .hover(|s| {
+                                                        s.background(config.color(
+                                                            LapceColor::PANEL_HOVERED_BACKGROUND,
+                                                        ))
+                                                    })
+                                            })
+                                    },
+                                )
+                                .style(|s| s.flex_col().min_width(180.0)),
+                            )
+                            .on_event_stop(EventListener::PointerDown, |_| {})
+                            .style(move |s| {
+                                let config = config.get();
+                                s.max_height(260.0)
+                                    .margin_left(16.0)
+                                    .margin_bottom(input_height.get() + 56.0)
+                                    .border(1.0)
+                                    .border_radius(6.0)
+                                    .border_color(
+                                        config.color(LapceColor::LAPCE_BORDER),
+                                    )
+                                    .background(
+                                        config.color(LapceColor::PANEL_BACKGROUND),
+                                    )
+                            })
+                            .into_any()
+                        }
+                        ChatDropdown::History => {
+                            let wtd = wtd_for_hist.clone();
+                            scroll(
+                                dyn_stack(
+                                    move || sessions_sig.get(),
+                                    |row| row.id.clone(),
+                                    move |row| {
+                                        let wtd = wtd.clone();
+                                        let click_id = row.id.clone();
+                                        // Copy crow-ade's setSessions layout:
+                                        // line 1 = full agent_id + date;
+                                        // line 2 = title / first message.
+                                        // agent_id includes the 1-based index
+                                        // suffix (e.g. "cool-name-1"); fall
+                                        // back to session_id if absent.
+                                        let full_id = row
+                                            .agent_id
+                                            .clone()
+                                            .unwrap_or_else(|| row.id.clone());
+                                        let has_date = row.updated_at.is_some();
+                                        let date_text = row
+                                            .updated_at
+                                            .as_deref()
+                                            .map(|d| {
+                                                if d.len() >= 10 {
+                                                    d[..10].to_string()
+                                                } else {
+                                                    d.to_string()
+                                                }
+                                            })
+                                            .unwrap_or_default();
+                                        let has_title = row
+                                            .title
+                                            .as_deref()
+                                            .map(|t| {
+                                                !t.is_empty()
+                                                    && t != "Untitled Chat"
+                                            })
+                                            .unwrap_or(false);
+                                        let title_text = row
+                                            .title
+                                            .as_deref()
+                                            .map(|t| {
+                                                t.replace(['\n', '\r'], " ")
+                                                    .split_whitespace()
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ")
+                                            })
+                                            .unwrap_or_default();
+                                        stack((
+                                            // Line 1: full id + date
+                                            stack((
+                                                label(move || full_id.clone())
+                                                    .style(move |s| {
+                                                        let config = config.get();
+                                                        s.flex_grow(1.0)
+                                                            .flex_basis(0.0)
+                                                            .font_size(11.0)
+                                                            .selectable(false)
+                                                            .color(config.color(
+                                                                LapceColor::EDITOR_FOREGROUND,
+                                                            ))
+                                                    }),
+                                                label(move || date_text.clone())
+                                                    .style(move |s| {
+                                                        let config = config.get();
+                                                        s.margin_left(8.0)
+                                                            .font_size(10.0)
+                                                            .selectable(false)
+                                                            .color(config.color(
+                                                                LapceColor::EDITOR_DIM,
+                                                            ))
+                                                            .apply_if(
+                                                                !has_date,
+                                                                |s| s.hide(),
+                                                            )
+                                                    }),
+                                            ))
+                                            .style(|s| {
+                                                s.flex_row()
+                                                    .items_center()
+                                                    .width_pct(100.0)
+                                            }),
+                                            // Line 2: title / first message
+                                            label(move || title_text.clone())
+                                                .style(move |s| {
+                                                    let config = config.get();
+                                                    s.width_pct(100.0)
+                                                        .font_size(10.0)
+                                                        .selectable(false)
+                                                        .color(config.color(
+                                                            LapceColor::EDITOR_DIM,
+                                                        ))
+                                                        .apply_if(
+                                                            !has_title,
+                                                            |s| s.hide(),
+                                                        )
+                                                }),
+                                        ))
+                                        .on_click_stop(move |_| {
+                                            wtd.load_chat_session(
+                                                chat_id,
+                                                click_id.clone(),
+                                            );
+                                            dropdown.set(ChatDropdown::None);
+                                        })
+                                        .style(move |s| {
+                                            let config = config.get();
+                                            s.flex_col()
+                                                .width_pct(100.0)
+                                                .padding_horiz(10.0)
+                                                .padding_vert(4.0)
+                                                .cursor(CursorStyle::Pointer)
+                                                .hover(|s| {
+                                                    s.background(config.color(
+                                                        LapceColor::PANEL_HOVERED_BACKGROUND,
+                                                    ))
+                                                })
+                                        })
+                                    },
+                                )
+                                .style(|s| s.flex_col().width_pct(100.0)),
+                            )
+                            .on_event_stop(EventListener::PointerDown, |_| {})
+                            .style(move |s| {
+                                let config = config.get();
+                                // Fixed-pixel cap (NOT a percentage — the
+                                // overlay's inner stack is auto-height, so a
+                                // %-cap resolved to nothing and the 500+ row
+                                // list filled the whole panel).
+                                s.width_pct(90.0)
+                                    .min_width(300.0)
+                                    .max_height(320.0)
+                                    .border(1.0)
+                                    .border_radius(8.0)
+                                    .border_color(
+                                        config.color(LapceColor::LAPCE_BORDER),
+                                    )
+                                    .background(
+                                        config.color(LapceColor::PANEL_BACKGROUND),
+                                    )
+                            })
+                            .into_any()
+                        }
+                        ChatDropdown::None => empty().into_any(),
+                    },
+                )
+                .style(|s| s.flex_col()),
+            )
+            .on_event_stop(EventListener::PointerDown, move |_| {
+                dropdown.set(ChatDropdown::None);
+            })
+            .style(move |s| {
+                let config = config.get();
+                let kind = dropdown.get();
+                s.absolute()
+                    .size_pct(100.0, 100.0)
+                    .flex_col()
+                    .apply_if(kind == ChatDropdown::None, |s| s.hide())
+                    .apply_if(kind == ChatDropdown::History, |s| {
+                        s.items_center().justify_center().background(
+                            config
+                                .color(LapceColor::LAPCE_DROPDOWN_SHADOW)
+                                .multiply_alpha(0.3),
+                        )
+                    })
+                    .apply_if(
+                        kind == ChatDropdown::Agent || kind == ChatDropdown::Model,
+                        |s| s.items_start().justify_end(),
+                    )
             })
         },
     ))

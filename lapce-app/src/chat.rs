@@ -537,13 +537,14 @@ pub fn parse_model_select(options: &serde_json::Value) -> Option<ModelSelect> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorySession {
     pub id: String,
+    pub agent_id: Option<String>,
     pub title: Option<String>,
     pub updated_at: Option<String>,
 }
 
 /// Parse a `SessionInfo[]` JSON value into history rows, excluding `exclude`
 /// (the live session — no point offering to reload it). Tolerant of both
-/// camelCase (`sessionId`/`updatedAt`) and snake_case keys.
+/// camelCase (`sessionId`/`updatedAt`/`agentId`) and snake_case keys.
 pub fn parse_history_sessions(
     sessions: &serde_json::Value,
     exclude: Option<&str>,
@@ -552,7 +553,8 @@ pub fn parse_history_sessions(
         Some(a) => a,
         None => return Vec::new(),
     };
-    arr.iter()
+    let mut rows: Vec<HistorySession> = arr
+        .iter()
         .filter_map(|s| {
             let id = s
                 .get("sessionId")
@@ -562,6 +564,12 @@ pub fn parse_history_sessions(
             if id.is_empty() || exclude == Some(id.as_str()) {
                 return None;
             }
+            let agent_id = s
+                .get("agentId")
+                .and_then(|v| v.as_str())
+                .or_else(|| s.get("agent_id").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .filter(|a| !a.is_empty());
             let title = s
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -573,9 +581,19 @@ pub fn parse_history_sessions(
                 .or_else(|| s.get("updated_at").and_then(|v| v.as_str()))
                 .map(str::to_string)
                 .filter(|t| !t.is_empty());
-            Some(HistorySession { id, title, updated_at })
+            Some(HistorySession {
+                id,
+                agent_id,
+                title,
+                updated_at,
+            })
         })
-        .collect()
+        .collect();
+    // Most-recent-first: ISO-8601 `updated_at` strings sort chronologically,
+    // so a descending compare puts the newest on top; sessions without a
+    // timestamp (`None`) sink to the bottom.
+    rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    rows
 }
 
 impl ChatData {
@@ -1509,14 +1527,15 @@ mod tests {
     fn parse_history_sessions_excludes_live_and_reads_fields() {
         use serde_json::json;
         let sessions = json!([
-            { "sessionId": "live", "cwd": "/x", "title": "Current", "updatedAt": "2026-07-22T00:00:00Z" },
-            { "sessionId": "old-1", "cwd": "/x", "title": "Hello", "updatedAt": "2026-07-21T00:00:00Z" },
-            { "sessionId": "old-2", "cwd": "/x", "title": "", "updatedAt": null },
+            { "sessionId": "live", "agentId": "live-1", "cwd": "/x", "title": "Current", "updatedAt": "2026-07-22T00:00:00Z" },
+            { "sessionId": "old-1", "agentId": "old-1-1", "cwd": "/x", "title": "Hello", "updatedAt": "2026-07-21T00:00:00Z" },
+            { "sessionId": "old-2", "agentId": "old-2-2", "cwd": "/x", "title": "", "updatedAt": null },
             { "sessionId": "", "cwd": "/x" }
         ]);
         let rows = parse_history_sessions(&sessions, Some("live"));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "old-1");
+        assert_eq!(rows[0].agent_id.as_deref(), Some("old-1-1"));
         assert_eq!(rows[0].title.as_deref(), Some("Hello"));
         assert_eq!(
             rows[0].updated_at.as_deref(),
@@ -1524,10 +1543,27 @@ mod tests {
         );
         // Empty title → None; null updated_at → None; empty id dropped.
         assert_eq!(rows[1].id, "old-2");
+        assert_eq!(rows[1].agent_id.as_deref(), Some("old-2-2"));
         assert!(rows[1].title.is_none());
         assert!(rows[1].updated_at.is_none());
         // Not an array → empty.
         assert!(parse_history_sessions(&json!({}), None).is_empty());
+    }
+
+    #[test]
+    fn parse_history_sessions_orders_most_recent_first() {
+        use serde_json::json;
+        // Deliberately out of chronological order; a missing timestamp sinks
+        // to the bottom.
+        let sessions = json!([
+            { "sessionId": "a", "updatedAt": "2026-07-01T00:00:00Z" },
+            { "sessionId": "no-date" },
+            { "sessionId": "c", "updatedAt": "2026-07-20T00:00:00Z" },
+            { "sessionId": "b", "updatedAt": "2026-07-10T00:00:00Z" }
+        ]);
+        let rows = parse_history_sessions(&sessions, None);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a", "no-date"]);
     }
 
     #[test]
