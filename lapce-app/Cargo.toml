@@ -49,7 +49,7 @@ tracing-appender   = { workspace = true }
 url                = { workspace = true }
 zstd               = { workspace = true }
 floem              = { workspace = true }
-floem-typst        = { path = "../../floem-typst" }
+floem-typst        = { workspace = true }
 
 pulldown-cmark   = { version = "0.11.0" }
 Inflector        = { version = "0.11.4" }

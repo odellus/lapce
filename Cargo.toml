@@ -20,7 +20,7 @@ name = "lapce-proxy"
 path = "lapce-proxy/src/bin/lapce-proxy.rs"
 
 [workspace]
-members = ["lapce-app", "lapce-proxy", "lapce-rpc", "lapce-core"]
+members = ["lapce-app", "lapce-proxy", "lapce-rpc", "lapce-core", "floem-typst"]
 
 [workspace.package]
 version      = "0.4.6"
@@ -75,6 +75,7 @@ lapce-xi-rope = { version = "0.3.2", features = ["serde"] }
 lapce-core  = { path = "./lapce-core" }
 lapce-rpc   = { path = "./lapce-rpc" }
 lapce-proxy = { path = "./lapce-proxy" }
+floem-typst = { path = "./floem-typst" }
 
 [workspace.dependencies.floem]
 # path = "../floem"

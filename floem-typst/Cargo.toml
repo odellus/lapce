@@ -1,0 +1,35 @@
+[package]
+name = "floem-typst"
+version = "0.1.0"
+edition = "2021"
+description = "Streaming Typst rendering as a floem View"
+license = "Apache-2.0"
+
+[dependencies]
+# floem — pinned to same rev as lapce workspace
+floem = { workspace = true }
+
+# typst compiler + types (crates.io)
+typst = "0.15"
+typst-library = "0.15"
+typst-layout = "0.15"
+typst-syntax = "0.15"
+typst-render = "0.15"
+typst-pdf = "0.15"
+
+# text/fonts
+fontdb = "0.23"
+
+# event types
+ui-events = { version = "0.3", features = ["kurbo"] }
+
+# async/timing
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+
+# utilities
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+winit = "0.30"
