@@ -498,9 +498,20 @@ impl ProxyHandler for Dispatcher {
             } => {
                 tracing::info!(session = %session_id, len = content.len(), "ACP: prompt");
                 if let Some(session) = self.acp_manager.get_session(&session_id) {
-                    if let Err(e) = session.prompt_async(&content) {
-                        tracing::error!("ACP prompt failed: {}", e);
-                    }
+                    let blocks = vec![serde_json::json!({
+                        "type": "text",
+                        "text": content,
+                    })];
+                    // Route through the queue so concurrent user prompts
+                    // serialize instead of racing on the agent's stdin.
+                    std::thread::Builder::new()
+                        .name("acp-user-prompt".to_string())
+                        .spawn(move || {
+                            if let Err(e) = session.prompt_with_queue(blocks) {
+                                tracing::error!("ACP prompt failed: {}", e);
+                            }
+                        })
+                        .ok();
                 }
             }
             AcpCancel { session_id } => {
@@ -555,6 +566,33 @@ impl ProxyHandler for Dispatcher {
                 params,
             } => {
                 self.handle_acp_tool(&session_id, &rpc_id, &method, params);
+            }
+            AcpPromptCallback {
+                target_session_id,
+                text,
+            } => {
+                // A worker finished its task list. Deliver a canned prompt
+                // to the caller (orchestrator) so it can query_memory.
+                if let Some(session) =
+                    self.acp_manager.get_session(&target_session_id)
+                {
+                    let blocks = vec![serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    })];
+                    let session = session.clone();
+                    std::thread::Builder::new()
+                        .name("acp-prompt-callback".to_string())
+                        .spawn(move || {
+                            if let Err(e) = session.prompt_with_queue(blocks) {
+                                tracing::error!(
+                                    "AcpPromptCallback failed: {}",
+                                    e
+                                );
+                            }
+                        })
+                        .ok();
+                }
             }
         }
     }
@@ -1460,6 +1498,70 @@ fn start_acp_session(
     }
 }
 
+// ─── Orchestration tool helpers ────────────────────────────────────────────
+
+fn format_task_summary(tasks: &[crate::acp::orchestration::Task]) -> String {
+    if tasks.is_empty() {
+        return "No tasks".to_string();
+    }
+    use crate::acp::orchestration::TaskStatus;
+    let pending = tasks.iter().filter(|t| t.status == TaskStatus::Pending).count();
+    let in_progress = tasks.iter().filter(|t| t.status == TaskStatus::InProgress).count();
+    let completed = tasks.iter().filter(|t| t.status == TaskStatus::Completed).count();
+    let failed = tasks.iter().filter(|t| t.status == TaskStatus::Failed).count();
+    let cancelled = tasks.iter().filter(|t| t.status == TaskStatus::Cancelled).count();
+    format!(
+        "Total: {} | Pending: {} | In Progress: {} | Completed: {} | Failed: {} | Cancelled: {}",
+        tasks.len(), pending, in_progress, completed, failed, cancelled,
+    )
+}
+
+fn format_orchestrator_task_summary(
+    tasks: &[crate::acp::orchestration::OrchestratorTask],
+) -> String {
+    if tasks.is_empty() {
+        return "No orchestrator tasks".to_string();
+    }
+    use crate::acp::orchestration::OrchestratorTaskStatus;
+    let pending = tasks.iter().filter(|t| t.status == OrchestratorTaskStatus::Pending).count();
+    let in_progress = tasks.iter().filter(|t| t.status == OrchestratorTaskStatus::InProgress).count();
+    let delegated = tasks.iter().filter(|t| t.status == OrchestratorTaskStatus::Delegated).count();
+    let completed = tasks.iter().filter(|t| t.status == OrchestratorTaskStatus::Completed).count();
+    let failed = tasks.iter().filter(|t| t.status == OrchestratorTaskStatus::Failed).count();
+    let cancelled = tasks.iter().filter(|t| t.status == OrchestratorTaskStatus::Cancelled).count();
+    format!(
+        "Total: {} | Pending: {} | In Progress: {} | Delegated: {} | Completed: {} | Failed: {} | Cancelled: {}",
+        tasks.len(), pending, in_progress, delegated, completed, failed, cancelled,
+    )
+}
+
+fn parse_task_status(s: &str) -> Option<crate::acp::orchestration::TaskStatus> {
+    use crate::acp::orchestration::TaskStatus;
+    match s {
+        "pending" => Some(TaskStatus::Pending),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "completed" => Some(TaskStatus::Completed),
+        "failed" => Some(TaskStatus::Failed),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn parse_orchestrator_task_status(
+    s: &str,
+) -> Option<crate::acp::orchestration::OrchestratorTaskStatus> {
+    use crate::acp::orchestration::OrchestratorTaskStatus;
+    match s {
+        "pending" => Some(OrchestratorTaskStatus::Pending),
+        "in_progress" => Some(OrchestratorTaskStatus::InProgress),
+        "delegated" => Some(OrchestratorTaskStatus::Delegated),
+        "completed" => Some(OrchestratorTaskStatus::Completed),
+        "failed" => Some(OrchestratorTaskStatus::Failed),
+        "cancelled" => Some(OrchestratorTaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
 impl Dispatcher {
     pub fn new(core_rpc: CoreRpcHandler, proxy_rpc: ProxyRpcHandler) -> Self {
         let plugin_rpc =
@@ -1784,6 +1886,280 @@ impl Dispatcher {
                 let _ = session
                     .send_tool_response(rpc_id, serde_json::json!({}));
             }
+
+            // ─── Orchestration tools (ported from crow-ade) ────────────────
+
+            "_task/read" | "task_read" => {
+                let orch = session.orchestration.lock().unwrap();
+                let tasks = orch.task_list.clone();
+                drop(orch);
+                let summary = format_task_summary(&tasks);
+                let _ = session.send_tool_response(
+                    rpc_id,
+                    serde_json::json!({ "tasks": tasks, "summary": summary }),
+                );
+            }
+            "_task/write" | "task_write" => {
+                let todos = params
+                    .get("todos")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let now = chrono::Utc::now();
+                let tasks: Vec<crate::acp::orchestration::Task> = todos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, todo)| {
+                        crate::acp::orchestration::Task {
+                            id: i.to_string(),
+                            title: todo
+                                .get("content")
+                                .or_else(|| todo.get("title"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&format!("Task {}", i + 1))
+                                .to_string(),
+                            description: None,
+                            status: todo
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .and_then(parse_task_status)
+                                .unwrap_or(
+                                    crate::acp::orchestration::TaskStatus::Pending,
+                                ),
+                            priority: todo
+                                .get("priority")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("medium")
+                                .to_string(),
+                            assigned_to: todo
+                                .get("assignedTo")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            created_at: now,
+                            updated_at: now,
+                        }
+                    })
+                    .collect();
+                {
+                    let mut orch = session.orchestration.lock().unwrap();
+                    orch.task_list = tasks.clone();
+                }
+                session.broadcast_task_list();
+                let _ = session.send_tool_response(
+                    rpc_id,
+                    serde_json::json!({ "tasks": tasks }),
+                );
+            }
+            "_task/orchestrator/read" | "orchestrator_task_read" => {
+                let orch = session.orchestration.lock().unwrap();
+                let tasks = orch.orchestrator_task_list.clone();
+                drop(orch);
+                let summary = format_orchestrator_task_summary(&tasks);
+                let _ = session.send_tool_response(
+                    rpc_id,
+                    serde_json::json!({ "tasks": tasks, "summary": summary }),
+                );
+            }
+            "_task/orchestrator/write" | "orchestrator_task_write" => {
+                let todos = params
+                    .get("todos")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let now = chrono::Utc::now();
+                let tasks: Vec<crate::acp::orchestration::OrchestratorTask> =
+                    todos
+                        .iter()
+                        .enumerate()
+                        .map(|(i, todo)| {
+                            crate::acp::orchestration::OrchestratorTask {
+                                id: i.to_string(),
+                                title: todo
+                                    .get("content")
+                                    .or_else(|| todo.get("title"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&format!("Task {}", i + 1))
+                                    .to_string(),
+                                description: None,
+                                status: todo
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(parse_orchestrator_task_status)
+                                    .unwrap_or(
+                                        crate::acp::orchestration::OrchestratorTaskStatus::Pending,
+                                    ),
+                                priority: todo
+                                    .get("priority")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("medium")
+                                    .to_string(),
+                                assigned_to: todo
+                                    .get("assignedTo")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from),
+                                created_at: now,
+                                updated_at: now,
+                            }
+                        })
+                        .collect();
+                {
+                    let mut orch = session.orchestration.lock().unwrap();
+                    orch.orchestrator_task_list = tasks.clone();
+                }
+                session.broadcast_orchestrator_task_list();
+                let _ = session.send_tool_response(
+                    rpc_id,
+                    serde_json::json!({ "tasks": tasks }),
+                );
+            }
+            "_task/send" | "task_send" => {
+                let to_sid = params
+                    .get("toSessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let task_defs = params
+                    .get("tasks")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let target = self.acp_manager.get_session(to_sid);
+                match target {
+                    Some(target_session) => {
+                        let now = chrono::Utc::now();
+                        let tasks: Vec<crate::acp::orchestration::Task> =
+                            task_defs
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, def)| {
+                                    let title =
+                                        def.get("title")?.as_str()?.to_string();
+                                    Some(crate::acp::orchestration::Task {
+                                        id: i.to_string(),
+                                        title,
+                                        description: def
+                                            .get("description")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from),
+                                        status:
+                                            crate::acp::orchestration::TaskStatus::Pending,
+                                        priority: "medium".to_string(),
+                                        assigned_to: None,
+                                        created_at: now,
+                                        updated_at: now,
+                                    })
+                                })
+                                .collect();
+
+                        {
+                            let mut orch =
+                                target_session.orchestration.lock().unwrap();
+                            orch.task_list = tasks.clone();
+                            orch.set_caller(session_id.to_string());
+                        }
+                        target_session.broadcast_task_list();
+
+                        let _ = session.send_tool_response(
+                            rpc_id,
+                            serde_json::json!({
+                                "success": true,
+                                "taskCount": tasks.len(),
+                                "toSessionId": to_sid,
+                            }),
+                        );
+
+                        // Start the target's task loop on a spawned thread.
+                        let target = target_session.clone();
+                        std::thread::Builder::new()
+                            .name("acp-task-loop".to_string())
+                            .spawn(move || {
+                                if let Err(e) = target.run_task_loop() {
+                                    tracing::error!(
+                                        "task_send: target task loop failed: {}",
+                                        e
+                                    );
+                                }
+                                target.notify_if_done();
+                            })
+                            .ok();
+                    }
+                    None => {
+                        let _ = session.send_tool_error(
+                            rpc_id,
+                            -32000,
+                            &format!("target session not found: {}", to_sid),
+                        );
+                    }
+                }
+            }
+            "_send" | "send_to_session" => {
+                let to_sid = params
+                    .get("toSessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let blocks = params
+                    .get("blocks")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let target = self.acp_manager.get_session(to_sid);
+                match target {
+                    Some(target_session) => {
+                        let _ = session.send_tool_response(
+                            rpc_id,
+                            serde_json::json!({
+                                "status": "sent",
+                                "toSessionId": to_sid,
+                            }),
+                        );
+
+                        // Fire-and-forget prompt to target.
+                        let caller_sid = session_id.to_string();
+                        let target = target_session.clone();
+                        // Capture caller session now (before spawn) so we
+                        // don't need the manager inside the thread.
+                        let caller_session =
+                            self.acp_manager.get_session(&caller_sid);
+                        std::thread::Builder::new()
+                            .name("acp-send-to-session".to_string())
+                            .spawn(move || {
+                                let result = target.prompt_with_queue(blocks);
+                                // Notify caller when done.
+                                if let Some(caller) = caller_session {
+                                    let worker_sid = target.session_id();
+                                    let text = match &result {
+                                        Ok(()) => format!(
+                                            "Session {} has finished. \
+                                             Call query_memory with session_id=\"{}\", limit=1 \
+                                             to see what it did.",
+                                            worker_sid, worker_sid
+                                        ),
+                                        Err(e) => format!(
+                                            "Session {} finished with error: {}. \
+                                             Call query_memory with session_id=\"{}\".",
+                                            worker_sid, e, worker_sid
+                                        ),
+                                    };
+                                    let blocks = vec![serde_json::json!({
+                                        "type": "text",
+                                        "text": text,
+                                    })];
+                                    let _ = caller.prompt_with_queue(blocks);
+                                }
+                            })
+                            .ok();
+                    }
+                    None => {
+                        let _ = session.send_tool_error(
+                            rpc_id,
+                            -32000,
+                            &format!("target session not found: {}", to_sid),
+                        );
+                    }
+                }
+            }
+
             other => {
                 tracing::info!(
                     method = %other,

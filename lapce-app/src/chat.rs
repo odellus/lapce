@@ -132,6 +132,12 @@ pub struct ChatData {
     pub config_options: RwSignal<serde_json::Value>,
     /// Past sessions for the history dropdown (fed by `AcpSessionList`).
     pub sessions: RwSignal<Vec<HistorySession>>,
+    /// Queued prompts waiting for the current turn to finish.
+    pub queued_items: RwSignal<serde_json::Value>,
+    /// Worker task list (fed by `task_list_update` session updates).
+    pub task_list: RwSignal<serde_json::Value>,
+    /// Orchestrator task list (fed by `orchestrator_task_list_update`).
+    pub orchestrator_task_list: RwSignal<serde_json::Value>,
     /// Whether the agent is currently processing a prompt.
     pub is_loading: RwSignal<bool>,
     /// The chat input, a real (multi-line) lapce editor backed by an
@@ -635,6 +641,9 @@ impl ChatData {
                 Vec::new(),
             )),
             sessions: cx.create_rw_signal(Vec::new()),
+            queued_items: cx.create_rw_signal(serde_json::json!([])),
+            task_list: cx.create_rw_signal(serde_json::json!([])),
+            orchestrator_task_list: cx.create_rw_signal(serde_json::json!([])),
             is_loading: cx.create_rw_signal(false),
             input_editor,
             input_height: cx.create_rw_signal(200.0),
@@ -1110,6 +1119,21 @@ impl ChatData {
             .unwrap_or("");
 
         match session_update {
+            "queue_changed" => {
+                if let Some(items) = update.get("items") {
+                    self.queued_items.set(items.clone());
+                }
+            }
+            "task_list_update" => {
+                if let Some(tasks) = update.get("tasks") {
+                    self.task_list.set(tasks.clone());
+                }
+            }
+            "orchestrator_task_list_update" => {
+                if let Some(tasks) = update.get("tasks") {
+                    self.orchestrator_task_list.set(tasks.clone());
+                }
+            }
             "agent_message_chunk" => {
                 if let Some(text) = Self::extract_text_from_chunk(&update) {
                     self.append_assistant_text(&text);

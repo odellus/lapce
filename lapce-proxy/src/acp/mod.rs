@@ -7,6 +7,8 @@
 //! to lapce's synchronous crossbeam-channel architecture.
 
 pub mod agent;
+pub mod log;
+pub mod orchestration;
 pub mod pty;
 pub mod session;
 pub mod terminal;

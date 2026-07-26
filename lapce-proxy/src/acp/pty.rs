@@ -25,6 +25,7 @@ use alacritty_terminal::{
 use polling::PollMode;
 
 use super::AcpTerminal;
+use crate::acp_log;
 
 /// Poller token for the PTY master read/write fd. alacritty registers the
 /// child-event fd at `token + 1`, so this must be 0 and the child token 1
@@ -77,7 +78,7 @@ pub fn run_acp_pty(
     let poller: Arc<polling::Poller> = match polling::Poller::new() {
         Ok(p) => p.into(),
         Err(err) => {
-            tracing::error!("ACP pty: poller creation failed: {err}");
+            acp_log!("ERROR", "ACP pty: poller creation failed: {err}");
             term.set_exit(None);
             return None;
         }
@@ -91,7 +92,7 @@ pub fn run_acp_pty(
     // PTY_CHILD_EVENT_TOKEN).
     unsafe {
         if let Err(err) = pty.register(&poller, interest, poll_opts) {
-            tracing::error!("ACP pty: register failed: {err}");
+            acp_log!("ERROR", "ACP pty: register failed: {err}");
             term.set_exit(None);
             return None;
         }
@@ -108,7 +109,7 @@ pub fn run_acp_pty(
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => {
-                tracing::error!("ACP pty: poll error: {err}");
+                acp_log!("ERROR", "ACP pty: poll error: {err}");
                 break;
             }
         }
@@ -142,7 +143,7 @@ pub fn run_acp_pty(
                             if err.raw_os_error() == Some(libc::EIO) {
                                 continue;
                             }
-                            tracing::error!("ACP pty: read error: {err}");
+                            acp_log!("ERROR", "ACP pty: read error: {err}");
                             break 'event_loop;
                         }
                     }
@@ -153,7 +154,7 @@ pub fn run_acp_pty(
     }
 
     if let Err(err) = pty.deregister(&poller) {
-        tracing::error!("ACP pty: deregister failed: {err}");
+        acp_log!("ERROR", "ACP pty: deregister failed: {err}");
     }
     term.set_exit(exit_code);
     exit_code

@@ -415,6 +415,12 @@ pub enum ProxyNotification {
         method: String,
         params: serde_json::Value,
     },
+    /// A worker session finished its task list; deliver a canned prompt to
+    /// the caller (orchestrator) session so it can query_memory for results.
+    AcpPromptCallback {
+        target_session_id: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

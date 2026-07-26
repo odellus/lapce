@@ -33,7 +33,7 @@ authors      = ["Dongdong Zhou <dzhou121@gmail.com>"]
 [workspace.dependencies]
 anyhow            = { version = "1.0" }
 backtrace         = { version = "0.3" }
-chrono            = { version = "0.4" }
+chrono            = { version = "0.4", features = ["serde"] }
 clap              = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive"] }
 crossbeam-channel = { version = "0.5.12" }
 directories       = { version = "4.0.1" }

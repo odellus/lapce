@@ -263,6 +263,104 @@ pub fn chat_view(
                     .apply_if(!is_loading.get(), |s| s.hide())
             })
         },
+        // Queue indicator — shows queued prompt items above the input.
+        {
+            let queued = chat.queued_items;
+            dyn_stack(
+                move || {
+                    let items = queued.get();
+                    let arr = items.as_array().cloned().unwrap_or_default();
+                    arr.into_iter().enumerate().collect::<Vec<_>>()
+                },
+                |(i, _)| *i,
+                move |(_i, item)| {
+                    let text = item
+                        .as_array()
+                        .and_then(|blocks| blocks.first())
+                        .and_then(|b| b.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(queued prompt)")
+                        .to_string();
+                    let display = if text.len() > 60 {
+                        format!("{}…", &text[..57])
+                    } else {
+                        text
+                    };
+                    label(move || format!("⏳ {}", display.clone()))
+                        .style(move |s| {
+                            let config = config.get();
+                            s.width_pct(100.0)
+                                .padding_horiz(16.0)
+                                .padding_vert(2.0)
+                                .font_size(11.0)
+                                .color(config.color(LapceColor::EDITOR_DIM))
+                                .text_ellipsis()
+                                .border_bottom(1.0)
+                                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                        })
+                },
+            )
+            .style(|s| s.width_pct(100.0).flex_col())
+        },
+        // Task list — compact inline display of worker/orchestrator tasks.
+        {
+            let task_list_sig = chat.task_list;
+            let orch_task_list_sig = chat.orchestrator_task_list;
+            dyn_stack(
+                move || {
+                    let mut rows: Vec<(String, String, String)> = Vec::new();
+                    // Worker tasks
+                    let tasks = task_list_sig.get();
+                    if let Some(arr) = tasks.as_array() {
+                        for t in arr {
+                            let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                            let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+                            rows.push(("task".to_string(), title, status));
+                        }
+                    }
+                    // Orchestrator tasks
+                    let orch = orch_task_list_sig.get();
+                    if let Some(arr) = orch.as_array() {
+                        for t in arr {
+                            let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                            let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+                            rows.push(("orch".to_string(), title, status));
+                        }
+                    }
+                    rows.into_iter().enumerate().collect::<Vec<_>>()
+                },
+                |(i, _)| *i,
+                move |(_, (kind, title, status))| {
+                    let icon = match status.as_str() {
+                        "completed" => "✓",
+                        "failed" => "✗",
+                        "cancelled" => "⊘",
+                        "in_progress" => "▶",
+                        "delegated" => "⇢",
+                        _ => "○",
+                    };
+                    let prefix = if kind == "orch" { "⚙ " } else { "" };
+                    label(move || format!("{}{}{} {}", icon, " ", prefix, title.clone()))
+                        .style(move |s| {
+                            let config = config.get();
+                            let color = match status.as_str() {
+                                "completed" => Color::from_rgba8(0x4e, 0xc2, 0x4e, 255),
+                                "failed" => config.color(LapceColor::LAPCE_ERROR),
+                                "in_progress" => config.color(LapceColor::EDITOR_FOREGROUND),
+                                "delegated" => Color::from_rgba8(0x56, 0x9c, 0xd6, 255),
+                                _ => config.color(LapceColor::EDITOR_DIM),
+                            };
+                            s.width_pct(100.0)
+                                .padding_horiz(16.0)
+                                .padding_vert(1.0)
+                                .font_size(11.0)
+                                .color(color)
+                                .text_ellipsis()
+                        })
+                },
+            )
+            .style(|s| s.width_pct(100.0).flex_col())
+        },
         // Input area — a real multi-line lapce editor. Enter sends,
         // Shift+Enter inserts a newline (wired via ChatInputFocus + the
         // Focus::Panel(Chat) key route in window_tab).
@@ -375,6 +473,7 @@ pub fn chat_view(
                                     .set(WrapProp, WrapMethod::EditorWidth)
                             }),
                     )
+                    .scroll_style(|s| s.hide_bars(true))
                     .style(|s| s.size_pct(100.0, 100.0)),
                 )
                     .style(move |s| {
@@ -391,7 +490,7 @@ pub fn chat_view(
                             .padding_left(10.0)
                             .padding_right(10.0)
                             .padding_top(8.0)
-                            .padding_bottom(4.0)
+                            .padding_bottom(8.0)
                     }),
                 // Bottom toolbar: agent selector (bottom-left), model selector
                 // (to its right), and the Send button pushed to the far right.

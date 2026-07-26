@@ -5,7 +5,7 @@
 //! Client tool requests (fs, terminal) are forwarded to the Dispatcher.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -14,6 +14,10 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use serde_json::{Value, json};
 
 use super::agent::{AgentConfig, AgentManager};
+use super::orchestration::{
+    OrchestrationState, PromptTurnState, QueueItem,
+};
+use crate::acp_log;
 use lapce_rpc::proxy::{ProxyNotification, ProxyRpcHandler};
 
 /// Events broadcast to the UI when something happens in a session.
@@ -64,6 +68,23 @@ pub struct AcpSession {
     /// on the dispatch thread that owns the open document model (`buffers`) —
     /// reads return the live unsaved buffer, writes update the editor.
     proxy_rpc: ProxyRpcHandler,
+
+    // ─── Orchestration / queue fields ──────────────────────────────────────
+
+    /// Pure orchestration state machine (task lists, caller session id).
+    pub orchestration: Mutex<OrchestrationState>,
+    /// Whether a prompt turn is currently in flight (serializes prompts).
+    pub prompt_busy: Mutex<bool>,
+    /// Prompts that arrived while busy — drained after each turn.
+    pub queue: Mutex<Vec<QueueItem>>,
+    /// Prompt turn lifecycle state (broadcast to UI).
+    pub prompt_turn_state: Mutex<PromptTurnState>,
+    /// Guard flag: true while the worker task loop is running.
+    pub task_loop_running: AtomicBool,
+    /// Guard flag: true while the orchestrator task loop is running.
+    pub orchestrator_task_loop_running: AtomicBool,
+    /// Channel for synchronous prompt (task loop blocks on this).
+    prompt_sync_tx: Mutex<Option<Sender<Value>>>,
 }
 
 impl AcpSession {
@@ -95,6 +116,13 @@ impl AcpSession {
             event_tx,
             cwd: cwd.to_string(),
             proxy_rpc,
+            orchestration: Mutex::new(OrchestrationState::default()),
+            prompt_busy: Mutex::new(false),
+            queue: Mutex::new(Vec::new()),
+            prompt_turn_state: Mutex::new(PromptTurnState::default()),
+            task_loop_running: AtomicBool::new(false),
+            orchestrator_task_loop_running: AtomicBool::new(false),
+            prompt_sync_tx: Mutex::new(None),
         });
 
         // Start the stdout reader loop in a background thread.
@@ -259,6 +287,395 @@ impl AcpSession {
         self.send_raw(&msg)
     }
 
+    // ─── Queue + task loop (ported from crow-ade prompt.rs) ────────────────
+
+    /// Send a prompt with content blocks. If busy, queue and return Ok.
+    /// Otherwise run the turn + drain queue + task loops.
+    ///
+    /// This is the sync equivalent of crow-ade's `prompt()`. It runs on the
+    /// caller's thread (the dispatch thread for user prompts, or a spawned
+    /// thread for task_send callbacks).
+    pub fn prompt_with_queue(&self, blocks: Vec<Value>) -> Result<()> {
+        // Try to acquire the busy lock.
+        {
+            let mut busy = self.prompt_busy.lock().unwrap();
+            if *busy {
+                self.queue.lock().unwrap().push(QueueItem::Prompt(blocks));
+                acp_log!(
+                    "INFO",
+                    "prompt_with_queue: session {} busy, queued (len={})",
+                    self.session_id(),
+                    self.queue.lock().unwrap().len()
+                );
+                self.broadcast_queue_state();
+                return Ok(());
+            }
+            *busy = true;
+        }
+
+        // Run the turn + drain.
+        let result = self.run_prompt_turn(blocks);
+        *self.prompt_busy.lock().unwrap() = false;
+        result
+    }
+
+    /// Inner: run one prompt turn, then task loops, then drain queue.
+    fn run_prompt_turn(&self, blocks: Vec<Value>) -> Result<()> {
+        let stop_reason = self.prompt_sync_blocks(&blocks)?;
+
+        if stop_reason == "cancelled" {
+            acp_log!(
+                "INFO",
+                "prompt: turn cancelled for session {}, pausing",
+                self.session_id()
+            );
+            return Ok(());
+        }
+
+        // Task loop
+        if self.should_run_task_loop() {
+            self.run_task_loop()?;
+        }
+
+        // Orchestrator task loop
+        if self.should_run_orchestrator_task_loop() {
+            self.run_orchestrator_task_loop()?;
+        }
+
+        // Drain queued prompts
+        loop {
+            let next = {
+                let mut q = self.queue.lock().unwrap();
+                if q.is_empty() {
+                    break;
+                }
+                q.remove(0)
+            };
+            self.broadcast_queue_state();
+            match next {
+                QueueItem::Prompt(blocks) => {
+                    let sr = self.prompt_sync_blocks(&blocks)?;
+                    if sr == "cancelled" {
+                        break;
+                    }
+                    if self.should_run_task_loop() {
+                        self.run_task_loop()?;
+                    }
+                    if self.should_run_orchestrator_task_loop() {
+                        self.run_orchestrator_task_loop()?;
+                    }
+                }
+                QueueItem::Task(task) => {
+                    let blocks = vec![json!({
+                        "type": "text",
+                        "text": format!("Task: {}", task.title),
+                    })];
+                    let sr = self.prompt_sync_blocks(&blocks)?;
+                    if sr == "cancelled" {
+                        break;
+                    }
+                    if self.should_run_task_loop() {
+                        self.run_task_loop()?;
+                    }
+                    if self.should_run_orchestrator_task_loop() {
+                        self.run_orchestrator_task_loop()?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send a prompt with content blocks and block until the response.
+    /// Returns the stopReason string.
+    fn prompt_sync_blocks(&self, blocks: &[Value]) -> Result<String> {
+        let session_id = self.session_id();
+        let params = json!({
+            "sessionId": session_id,
+            "prompt": blocks,
+        });
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": params,
+        });
+
+        // Set up the sync channel before sending.
+        let (tx, rx) = bounded(1);
+        *self.prompt_sync_tx.lock().unwrap() = Some(tx);
+        *self.active_prompt_id.lock().unwrap() = Some(id);
+
+        // Broadcast running state.
+        {
+            let mut state = self.prompt_turn_state.lock().unwrap();
+            *state = PromptTurnState::Running;
+        }
+        self.broadcast_prompt_state();
+
+        self.send_raw(&msg)?;
+
+        // Block until the read_loop delivers the response.
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .context("prompt_sync_blocks: timeout waiting for response")?;
+
+        let stop_reason = response
+            .get("stopReason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("end_turn")
+            .to_string();
+
+        // Broadcast complete state (unless cancelled — cancel sets it).
+        {
+            let mut state = self.prompt_turn_state.lock().unwrap();
+            if !matches!(*state, PromptTurnState::Cancelled) {
+                *state = PromptTurnState::Complete {
+                    stop_reason: stop_reason.clone(),
+                };
+            }
+        }
+        self.broadcast_prompt_state();
+
+        Ok(stop_reason)
+    }
+
+    /// True if the worker task loop should run.
+    pub fn should_run_task_loop(&self) -> bool {
+        let orch = self.orchestration.lock().unwrap();
+        orch.caller_session_id.is_some()
+            || orch.task_list.iter().any(|t| {
+                t.status == super::orchestration::TaskStatus::Pending
+                    || t.status == super::orchestration::TaskStatus::InProgress
+            })
+    }
+
+    /// True if the orchestrator task loop should run.
+    pub fn should_run_orchestrator_task_loop(&self) -> bool {
+        let orch = self.orchestration.lock().unwrap();
+        orch.orchestrator_task_list.iter().any(|t| {
+            t.status == super::orchestration::OrchestratorTaskStatus::Pending
+                || t.status == super::orchestration::OrchestratorTaskStatus::InProgress
+                || t.status == super::orchestration::OrchestratorTaskStatus::Delegated
+        })
+    }
+
+    /// Run the worker task loop: repeatedly prompt with the task list
+    /// until all tasks are done or cancelled.
+    pub fn run_task_loop(&self) -> Result<()> {
+        if self
+            .task_loop_running
+            .swap(true, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        loop {
+            let decision = {
+                let mut orch = self.orchestration.lock().unwrap();
+                orch.determine_next_prompt()
+            };
+
+            match decision {
+                Some(blocks) => {
+                    self.broadcast_task_list();
+                    let sr = self.prompt_sync_blocks(&blocks)?;
+                    if sr == "cancelled" {
+                        acp_log!(
+                            "INFO",
+                            "Task loop paused for session {} (cancelled)",
+                            self.session_id()
+                        );
+                        break;
+                    }
+                }
+                None => {
+                    acp_log!(
+                        "INFO",
+                        "Task loop complete for session {}",
+                        self.session_id()
+                    );
+                    break;
+                }
+            }
+        }
+
+        self.task_loop_running.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Run the orchestrator task loop.
+    pub fn run_orchestrator_task_loop(&self) -> Result<()> {
+        if self
+            .orchestrator_task_loop_running
+            .swap(true, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        loop {
+            let decision = {
+                let mut orch = self.orchestration.lock().unwrap();
+                orch.determine_next_orchestrator_prompt()
+            };
+
+            match decision {
+                Some(blocks) => {
+                    self.broadcast_orchestrator_task_list();
+                    let sr = self.prompt_sync_blocks(&blocks)?;
+                    if sr == "cancelled" {
+                        break;
+                    }
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        self.orchestrator_task_loop_running
+            .store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    // ─── Queue management ──────────────────────────────────────────────────
+
+    pub fn queue_add(&self, blocks: Vec<Value>) {
+        self.queue
+            .lock()
+            .unwrap()
+            .push(QueueItem::Prompt(blocks));
+        self.broadcast_queue_state();
+    }
+
+    pub fn queue_remove(&self, index: usize) -> Option<()> {
+        let mut q = self.queue.lock().unwrap();
+        if index < q.len() {
+            q.remove(index);
+            drop(q);
+            self.broadcast_queue_state();
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    pub fn queue_clear(&self) {
+        self.queue.lock().unwrap().clear();
+        self.broadcast_queue_state();
+    }
+
+    pub fn queue_list(&self) -> Vec<QueueItem> {
+        self.queue.lock().unwrap().clone()
+    }
+
+    // ─── Broadcast helpers ─────────────────────────────────────────────────
+
+    fn broadcast_queue_state(&self) {
+        let items = self.queue.lock().unwrap().clone();
+        let session_id = self.session_id();
+        let update = json!({
+            "sessionUpdate": "queue_changed",
+            "items": items,
+        });
+        let _ = self.event_tx.send(SessionEvent::Update {
+            session_id,
+            update,
+        });
+    }
+
+    fn broadcast_prompt_state(&self) {
+        let state = self.prompt_turn_state.lock().unwrap().clone();
+        let status = match &state {
+            PromptTurnState::Running => "running",
+            PromptTurnState::Idle => "idle",
+            PromptTurnState::Cancelled => "idle",
+            PromptTurnState::Complete { .. } => "idle",
+            PromptTurnState::Error { .. } => "idle",
+        };
+        let session_id = self.session_id();
+        let update = json!({
+            "sessionUpdate": "prompt_state",
+            "status": status,
+        });
+        let _ = self.event_tx.send(SessionEvent::Update {
+            session_id,
+            update,
+        });
+    }
+
+    pub fn broadcast_task_list(&self) {
+        let orch = self.orchestration.lock().unwrap();
+        let tasks = orch.task_list.clone();
+        drop(orch);
+        let session_id = self.session_id();
+        let update = json!({
+            "sessionUpdate": "task_list_update",
+            "tasks": tasks,
+        });
+        let _ = self.event_tx.send(SessionEvent::Update {
+            session_id,
+            update,
+        });
+    }
+
+    pub fn broadcast_orchestrator_task_list(&self) {
+        let orch = self.orchestration.lock().unwrap();
+        let tasks = orch.orchestrator_task_list.clone();
+        drop(orch);
+        let session_id = self.session_id();
+        let update = json!({
+            "sessionUpdate": "orchestrator_task_list_update",
+            "tasks": tasks,
+        });
+        let _ = self.event_tx.send(SessionEvent::Update {
+            session_id,
+            update,
+        });
+    }
+
+    /// If this session has a registered caller and all tasks are done,
+    /// notify the caller. Called after each prompt turn completes.
+    pub fn notify_if_done(&self) {
+        let caller_sid = {
+            let orch = self.orchestration.lock().unwrap();
+            let all_done = orch.task_list.iter().all(|t| {
+                t.status == super::orchestration::TaskStatus::Completed
+                    || t.status == super::orchestration::TaskStatus::Failed
+                    || t.status == super::orchestration::TaskStatus::Cancelled
+            });
+            if !all_done || orch.caller_session_id.is_none() {
+                return;
+            }
+            orch.caller_session_id.clone()
+        };
+
+        // Take the caller so we only notify once.
+        let caller_sid = match caller_sid {
+            Some(sid) => sid,
+            None => return,
+        };
+        {
+            let mut orch = self.orchestration.lock().unwrap();
+            orch.caller_session_id = None;
+        }
+
+        let worker_sid = self.session_id();
+        let text = format!(
+            "Session {} has completed its task list. \
+             Call query_memory(session_id=\"{}\", limit=1) to see the agent's last message.",
+            worker_sid, worker_sid
+        );
+
+        // Send the notification to the caller via the proxy RPC.
+        self.proxy_rpc.notification(ProxyNotification::AcpPromptCallback {
+            target_session_id: caller_sid,
+            text,
+        });
+    }
+
     /// List available sessions.
     pub fn list_sessions(&self, cwd: &str) -> Result<Value> {
         let params = json!({ "cwd": cwd });
@@ -293,10 +710,11 @@ impl AcpSession {
     /// Send a raw JSON value to the agent's stdin.
     fn send_raw(&self, msg: &Value) -> Result<()> {
         let line = serde_json::to_string(msg)?;
-        tracing::debug!(
-            conn = %self.connection_id,
-            msg = %line,
-            "ACP >> agent"
+        acp_log!(
+            "SEND",
+            "connection={} json={}",
+            self.connection_id,
+            line
         );
         self.agent_manager.send(&self.agent_id, &line)
     }
@@ -338,30 +756,33 @@ impl AcpSession {
 
         // Agent disconnected.
         let session_id = self.session_id();
-        tracing::info!(
-            conn = %self.connection_id,
-            session = %session_id,
-            "ACP: agent disconnected"
+        acp_log!(
+            "INFO",
+            "connection={} agent stdout closed, session={}",
+            self.connection_id,
+            session_id
         );
         let _ = self.event_tx.send(SessionEvent::Disconnected { session_id });
     }
 
     /// Handle a single JSON-RPC line from the agent.
     fn handle_line(&self, line: &str) {
-        tracing::debug!(
-            conn = %self.connection_id,
-            msg = %line,
-            "ACP << agent"
+        acp_log!(
+            "RECV",
+            "connection={} line={}",
+            self.connection_id,
+            line
         );
 
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    conn = %self.connection_id,
-                    line = %line,
-                    error = %e,
-                    "ACP: non-JSON line from agent, ignoring"
+                acp_log!(
+                    "ERROR",
+                    "connection={} non-JSON line from agent: {} (error: {})",
+                    self.connection_id,
+                    line,
+                    e
                 );
                 return;
             }
@@ -403,6 +824,17 @@ impl AcpSession {
                             session_id,
                             update,
                         });
+
+                        // Unblock prompt_sync_blocks if waiting.
+                        if let Some(tx) =
+                            self.prompt_sync_tx.lock().unwrap().take()
+                        {
+                            let result = msg
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(json!({}));
+                            let _ = tx.send(result);
+                        }
                     }
                 }
 
@@ -457,7 +889,7 @@ impl AcpSession {
                     });
                 }
                 _ => {
-                    tracing::debug!("Unhandled ACP notification: {}", method);
+                    acp_log!("WARN", "connection={} unhandled ACP notification: {}", self.connection_id, method);
                 }
             }
         }
@@ -488,11 +920,12 @@ impl AcpSessionManager {
         proxy_rpc: ProxyRpcHandler,
         load_session_id: Option<String>,
     ) -> Result<Arc<AcpSession>> {
-        tracing::info!(
-            agent = %config.name,
-            cwd = %cwd,
-            load = ?load_session_id,
-            "ACP: creating session"
+        acp_log!(
+            "INFO",
+            "Creating session: agent={}, cwd={}, load={:?}",
+            config.name,
+            cwd,
+            load_session_id
         );
         let session = AcpSession::spawn(
             &self.agent_manager,
@@ -501,24 +934,25 @@ impl AcpSessionManager {
             event_tx,
             proxy_rpc,
         )?;
-        tracing::info!(conn = %session.connection_id, "ACP: sending initialize");
+        acp_log!("INFO", "connection={} sending initialize", session.connection_id);
         session.initialize()?;
         match load_session_id {
             Some(target) => {
-                tracing::info!(
-                    conn = %session.connection_id,
-                    target = %target,
-                    "ACP: sending session/load (resume)"
+                acp_log!(
+                    "INFO",
+                    "connection={} sending session/load (resume) target={}",
+                    session.connection_id,
+                    target
                 );
                 session.load_session(&target, cwd)?;
             }
             None => {
-                tracing::info!(conn = %session.connection_id, "ACP: sending session/new");
+                acp_log!("INFO", "connection={} sending session/new", session.connection_id);
                 session.new_session(mcp_servers)?;
             }
         }
         let session_id = session.session_id();
-        tracing::info!(session = %session_id, "ACP: session ready");
+        acp_log!("INFO", "ACP session ready: {}", session_id);
         self.sessions
             .lock()
             .unwrap()

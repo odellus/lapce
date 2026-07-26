@@ -289,7 +289,28 @@ pub fn editor_view(
         EventPropagation::Stop
     })
     .class(EditorViewClass)
-    .style(move |s| editor_style(config, doc, s))
+    .style(move |s| {
+        let s = editor_style(config, doc, s);
+        // When word wrap is active on a non-local editor, override
+        // EditorWidth with WrapWidth so the wrap boundary leaves room
+        // for the vertical scrollbar (10px, matching BAR_WIDTH in
+        // paint_scroll_bar).  EditorWidth inside floem wraps at the
+        // full viewport width, which puts text under the scrollbar
+        // overlay.  WrapWidth lets us subtract the scrollbar width.
+        // The +10 in compute_layout then naturally becomes the
+        // scrollbar clearance (max_line_width + 10 ≈ viewport).
+        let cfg = config.get();
+        if cfg.editor.wrap_style != WrapStyle::None {
+            let is_local =
+                doc.get().content.with_untracked(|c| c.is_local());
+            if !is_local {
+                let vp_w = viewport.get().width();
+                let wrap_w = (vp_w - 20.0).max(100.0) as f32;
+                return s.set(WrapProp, WrapMethod::WrapWidth { width: wrap_w });
+            }
+        }
+        s
+    })
 }
 
 impl EditorView {

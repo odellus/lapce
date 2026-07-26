@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 
+use crate::acp_log;
+
 /// Configuration for an ACP agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -60,12 +62,13 @@ impl AgentManager {
     pub fn spawn(&self, config: &AgentConfig, cwd: &str) -> Result<String> {
         let id = format!("agent_{}", self.next_id.fetch_add(1, Ordering::Relaxed));
 
-        tracing::info!(
-            agent = %config.name,
-            command = %config.command,
-            args = ?config.args,
-            cwd = %cwd,
-            "ACP: spawning agent"
+        acp_log!(
+            "INFO",
+            "Spawning agent: name={}, command={}, args={:?}, cwd={}",
+            config.name,
+            config.command,
+            config.args,
+            cwd
         );
 
         let mut cmd = Command::new(&config.command);
@@ -89,7 +92,7 @@ impl AgentManager {
                     "Failed to spawn agent '{}' (command='{}', cwd='{}')",
                     config.name, config.command, cwd
                 );
-                tracing::error!(%err);
+                acp_log!("ERROR", "{}", err);
                 err
             })?;
 
@@ -131,7 +134,7 @@ impl AgentManager {
                         Err(_) => break,
                     }
                 }
-                tracing::info!("Agent {} stdout reader exited", id_out);
+                acp_log!("INFO", "Agent {} stdout reader exited", id_out);
             })?;
 
         // Thread: drain stderr → tracing logs.
@@ -145,7 +148,7 @@ impl AgentManager {
                         Ok(line) => {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
-                                tracing::warn!("[{} stderr] {}", id_err, trimmed);
+                                acp_log!("STDERR", "[{}] {}", id_err, trimmed);
                             }
                         }
                         Err(_) => break,
@@ -158,7 +161,7 @@ impl AgentManager {
         self.agents.lock().unwrap().insert(id.clone(), instance);
         self.stdout_receivers.lock().unwrap().insert(id.clone(), stdout_rx);
 
-        tracing::info!("Agent spawned: {} (id={})", config.name, id);
+        acp_log!("INFO", "Agent spawned: {} (id={})", config.name, id);
         Ok(id)
     }
 
@@ -182,7 +185,7 @@ impl AgentManager {
     /// Kill an agent process and remove it.
     pub fn kill(&self, agent_id: &str) {
         if let Some(mut instance) = self.agents.lock().unwrap().remove(agent_id) {
-            tracing::info!("Killing agent {}", agent_id);
+            acp_log!("INFO", "Killing agent {}", agent_id);
             let _ = instance.process.kill();
             let _ = instance.process.wait();
         }
