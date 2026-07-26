@@ -8,14 +8,18 @@ use std::sync::{Arc, RwLock};
 use alacritty_terminal::{
     Term,
     event::EventListener,
-    term::{Config, test::TermSize},
+    grid::{Dimensions, Scroll},
+    term::{Config, cell::Flags, test::TermSize},
     vte::ansi,
 };
 use floem::{
     Renderer, View, ViewId,
-    context::{PaintCx, UpdateCx},
+    context::{EventCx, PaintCx, UpdateCx},
+    event::{Event, EventPropagation},
     kurbo::{Point, Rect, Size},
-    reactive::{ReadSignal, RwSignal, SignalGet, SignalWith, create_effect},
+    reactive::{
+        ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith, create_effect,
+    },
     text::{Attrs, AttrsList, FamilyOwned, TextLayout, Weight},
 };
 use crate::config::{LapceConfig, color::LapceColor};
@@ -30,6 +34,9 @@ impl EventListener for NoopListener {
 pub struct ChatRawTerminal {
     pub parser: ansi::Processor,
     pub term: Term<NoopListener>,
+    /// Accumulated wheel delta (px) not yet consumed into whole-line scrolls,
+    /// mirroring the real terminal's `RawTerminal::scroll_delta`.
+    pub scroll_delta: f64,
 }
 
 impl ChatRawTerminal {
@@ -40,6 +47,7 @@ impl ChatRawTerminal {
         Self {
             parser: ansi::Processor::new(),
             term,
+            scroll_delta: 0.0,
         }
     }
 
@@ -58,10 +66,36 @@ pub struct ChatTermHandle {
     pub paint_gen: RwSignal<u64>,
 }
 
+impl ChatTermHandle {
+    /// Scroll the grid's display offset in response to a pointer-wheel delta.
+    ///
+    /// Mirrors the real terminal (`TerminalData::wheel_scroll`): accumulate the
+    /// pixel delta and convert to whole lines. Returns `true` when the wheel was
+    /// consumed (there is scrollback to move through) so the caller can stop the
+    /// event from also scrolling the surrounding chat; `false` when there is no
+    /// history and the chat should scroll instead.
+    pub fn wheel_scroll(&self, delta_y: f64, line_height: f64) -> bool {
+        let Ok(mut raw) = self.raw.write() else {
+            return false;
+        };
+        if raw.term.history_size() == 0 {
+            return false;
+        }
+        raw.scroll_delta -= delta_y;
+        let lines = (raw.scroll_delta / line_height) as i32;
+        if lines != 0 {
+            raw.scroll_delta -= lines as f64 * line_height;
+            raw.term.scroll_display(Scroll::Delta(lines));
+            self.paint_gen.update(|g| *g += 1);
+        }
+        true
+    }
+}
+
 /// Floem View that paints a `ChatRawTerminal` grid.
 pub struct ChatTerminalView {
     id: ViewId,
-    raw: Arc<RwLock<ChatRawTerminal>>,
+    handle: ChatTermHandle,
     config: ReadSignal<Arc<LapceConfig>>,
     size: Size,
 }
@@ -80,7 +114,7 @@ pub fn chat_terminal_view(
     });
     ChatTerminalView {
         id,
-        raw: handle.raw,
+        handle,
         config,
         size: Size::ZERO,
     }
@@ -93,6 +127,25 @@ impl View for ChatTerminalView {
 
     fn update(&mut self, cx: &mut UpdateCx, _state: Box<dyn std::any::Any>) {
         cx.app_state_mut().request_paint(self.id);
+    }
+
+    fn event_before_children(
+        &mut self,
+        cx: &mut EventCx,
+        event: &Event,
+    ) -> EventPropagation {
+        // Wheel over the terminal scrolls its own scrollback (alacritty /
+        // xterm.js behaviour). Only capture the event when there is history to
+        // move through; otherwise let the surrounding chat scroll.
+        if let Event::PointerWheel(e) = event {
+            let config = self.config.get_untracked();
+            let line_height = config.terminal_line_height() as f64;
+            if self.handle.wheel_scroll(e.delta.y, line_height) {
+                cx.app_state_mut().request_paint(self.id);
+                return EventPropagation::Stop;
+            }
+        }
+        EventPropagation::Continue
     }
 
     fn layout(
@@ -116,7 +169,7 @@ impl View for ChatTerminalView {
             let cols = (new_size.width / char_width).floor().max(1.0) as usize;
             let rows = (new_size.height / line_height).floor().max(1.0) as usize;
             let term_size = TermSize::new(cols, rows);
-            if let Ok(mut raw) = self.raw.write() {
+            if let Ok(mut raw) = self.handle.raw.write() {
                 raw.term.resize(term_size);
             }
         }
@@ -132,16 +185,17 @@ impl View for ChatTerminalView {
             FamilyOwned::parse_list(font_family).collect();
         let attrs = Attrs::new().family(&family).font_size(font_size as f32);
         let char_width = self.char_width(&config);
+        let char_height = self.char_height(&config);
 
         // Background
-        let bg = config.color(LapceColor::TERMINAL_BACKGROUND);
+        let term_bg = config.color(LapceColor::TERMINAL_BACKGROUND);
         cx.fill(
             &Rect::new(0.0, 0.0, self.size.width, self.size.height),
-            bg,
+            term_bg,
             0.0,
         );
 
-        let raw = match self.raw.read() {
+        let raw = match self.handle.raw.read() {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -152,28 +206,38 @@ impl View for ChatTerminalView {
             let cell = item.cell;
 
             let x = point.column.0 as f64 * char_width;
+            // `+ display_offset` pins the scrolled window to the top of the box:
+            // display_iter yields lines starting at `-display_offset`, so this
+            // normalises the first visible row to y == 0 whatever the offset.
             let y = (point.line.0 as f64 + content.display_offset as f64)
                 * line_height;
-            let char_y = y + (line_height - self.char_height(&config)) / 2.0;
+            let char_y = y + (line_height - char_height) / 2.0;
 
-            let cell_bg = config.terminal_get_color(&cell.bg, content.colors);
+            let mut bg = config.terminal_get_color(&cell.bg, content.colors);
             let mut fg = config.terminal_get_color(&cell.fg, content.colors);
 
-            if cell.flags.contains(alacritty_terminal::term::cell::Flags::DIM) {
+            if cell.flags.contains(Flags::DIM)
+                || cell.flags.contains(Flags::DIM_BOLD)
+            {
                 fg = fg.multiply_alpha(0.66);
             }
 
-            if bg != cell_bg {
+            // INVERSE swaps foreground/background (htop, ls highlights, …).
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
+            if term_bg != bg {
                 cx.fill(
                     &Rect::new(x, y, x + char_width, y + line_height),
-                    cell_bg,
+                    bg,
                     0.0,
                 );
             }
 
             if cell.c != ' ' && cell.c != '\t' {
-                let bold = cell.flags
-                    .contains(alacritty_terminal::term::cell::Flags::BOLD);
+                let bold = cell.flags.contains(Flags::BOLD)
+                    || cell.flags.contains(Flags::DIM_BOLD);
                 let mut a = attrs.clone().color(fg);
                 if bold {
                     a = a.weight(Weight::BOLD);
@@ -182,6 +246,43 @@ impl View for ChatTerminalView {
                 tl.set_text(&cell.c.to_string(), AttrsList::new(a), None);
                 cx.draw_text(&tl, Point::new(x, char_y));
             }
+
+            // Underline / strikeout drawn as 1px rules so they show even on
+            // blank cells, matching a real terminal.
+            if cell.flags.contains(Flags::UNDERLINE) {
+                let uy = (y + char_height + 1.0).min(y + line_height - 1.0);
+                cx.fill(&Rect::new(x, uy, x + char_width, uy + 1.0), fg, 0.0);
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                let sy = y + (line_height / 2.0);
+                cx.fill(&Rect::new(x, sy, x + char_width, sy + 1.0), fg, 0.0);
+            }
+        }
+
+        // Thin scrollbar — only when there is scrollback to communicate.
+        let history = raw.term.history_size();
+        if history > 0 && self.size.height > 0.0 {
+            let screen = raw.term.screen_lines().max(1);
+            let offset = raw.term.grid().display_offset().min(history);
+            let track_h = self.size.height;
+            let thumb_h = (track_h * (screen as f64 / (history + screen) as f64))
+                .clamp(16.0, track_h);
+            // offset 0 == live bottom; offset == history == fully scrolled up.
+            let frac = (history - offset) as f64 / history as f64;
+            let thumb_y = (track_h - thumb_h) * frac;
+
+            let gap = 2.0;
+            let sb_w = 6.0;
+            let x0 = self.size.width - sb_w - gap;
+            let x1 = self.size.width - gap;
+            let thumb = config.color(LapceColor::LAPCE_SCROLL_BAR);
+            let track = thumb.multiply_alpha(0.18);
+            cx.fill(&Rect::new(x0, 0.0, x1, track_h), track, 3.0);
+            cx.fill(
+                &Rect::new(x0, thumb_y, x1, thumb_y + thumb_h),
+                thumb,
+                3.0,
+            );
         }
     }
 }
@@ -331,5 +432,56 @@ mod tests {
             text.starts_with("hello"),
             "content should survive resize, got: {text:?}"
         );
+    }
+
+    #[test]
+    fn chat_terminal_wheel_scrolls_history() {
+        use floem::reactive::Scope;
+        let scope = Scope::new();
+        let raw = Arc::new(RwLock::new(ChatRawTerminal::new(24, 80)));
+        // Fill well past the screen so there is scrollback.
+        for i in 0..100 {
+            raw.write().unwrap().feed(format!("line {i}\r\n").as_bytes());
+        }
+        let handle = ChatTermHandle {
+            raw: raw.clone(),
+            paint_gen: scope.create_rw_signal(0u64),
+        };
+
+        // Live bottom before any wheel input.
+        assert_eq!(raw.read().unwrap().term.grid().display_offset(), 0);
+        assert!(raw.read().unwrap().term.history_size() > 0);
+
+        let line_height = 18.0;
+        // Wheel "up" (negative delta_y) scrolls up into history.
+        let consumed = handle.wheel_scroll(-line_height * 5.0, line_height);
+        assert!(consumed, "wheel over scrollback should be consumed");
+        let offset_after = raw.read().unwrap().term.grid().display_offset();
+        assert!(
+            offset_after > 0,
+            "display_offset should increase after scrolling up, got {offset_after}"
+        );
+
+        // Scrolling far back down clamps to the live bottom.
+        let _ = handle.wheel_scroll(line_height * 100.0, line_height);
+        assert_eq!(
+            raw.read().unwrap().term.grid().display_offset(),
+            0,
+            "scrolling far down should clamp back to the live bottom"
+        );
+    }
+
+    #[test]
+    fn chat_terminal_wheel_no_history_not_consumed() {
+        use floem::reactive::Scope;
+        let scope = Scope::new();
+        let raw = Arc::new(RwLock::new(ChatRawTerminal::new(24, 80)));
+        raw.write().unwrap().feed(b"just one line\r\n");
+        let handle = ChatTermHandle {
+            raw,
+            paint_gen: scope.create_rw_signal(0u64),
+        };
+        // No scrollback → wheel is not consumed (the chat scrolls instead).
+        assert!(!handle.wheel_scroll(-100.0, 18.0));
     }
 }
