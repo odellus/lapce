@@ -150,6 +150,10 @@ pub struct ChatData {
     /// Monotonically increasing counter, bumped on every block mutation.
     /// The view watches this to trigger auto-scroll.
     pub scroll_version: RwSignal<u64>,
+    /// Whether the message list should auto-scroll to bottom on new content.
+    /// Set to false when the user scrolls up; true when they scroll back to
+    /// the bottom or send a new prompt.
+    pub auto_scroll: RwSignal<bool>,
     /// Shared monotonic block-id allocator (interior mutability so clones
     /// of `ChatData` share the same counter).
     next_id: Rc<Cell<u64>>,
@@ -167,6 +171,14 @@ pub struct ChatData {
     /// Inline terminal grids for ACP client-side terminals, keyed by the
     /// string terminalId the agent receives from terminal/create.
     pub terminals: Rc<std::cell::RefCell<HashMap<String, ChatTermHandle>>>,
+    /// Tool-call ids the client has observed as a *read* (file-read) tool.
+    /// The agent's `tool_call` announcement carries `kind:"read"`, but the
+    /// later `tool_call_update` that delivers the file body (in a `content`
+    /// block) omits `kind`/`title` — so the client must remember the read
+    /// classification by id and muzzle the body when it arrives, instead of
+    /// feeding it into a terminal grid. Read is a client-side capability:
+    /// the client executes it and the client owns the decision to hide it.
+    pub read_tool_ids: Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     pub common: Rc<CommonData>,
 }
 
@@ -466,6 +478,31 @@ pub fn is_read_tool(kind: Option<&str>, title: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Decide, for a `tool_call_update` that carries a text `content` body, how
+/// the client handles the read-classification memory.
+///
+/// Returns `(remember, muzzle)`:
+/// - `remember` — store this tool-call id as a read (the *announcement* event
+///   is the only one that carries `kind:"read"`; the completed update that
+///   actually delivers the file body omits `kind`/`title`).
+/// - `muzzle` — skip feeding the body into a terminal grid. True when the id
+///   was *already* remembered from the announcement OR this event itself
+///   names a read.
+///
+/// The trap this encodes: the body-bearing completed update is unclassified
+/// (`kind`/`title` empty), so a per-event `is_read_tool(kind, title)` check
+/// on it returns false and the 5 KB file body leaks into the chat. The client
+/// must remember the classification by id across events — read is a
+/// client-side capability and the client owns the decision to hide it.
+fn read_content_decision(
+    already_remembered: bool,
+    kind: Option<&str>,
+    title: Option<&str>,
+) -> (bool, bool) {
+    let announce_read = is_read_tool(kind, title);
+    (announce_read, already_remembered || announce_read)
+}
+
 /// The model selector derived from a `SessionConfigOption[]` (the option whose
 /// `category == "model"` or `id == "model"`). Mirrors crow-ade's
 /// `acpChatEditor` conversion (`options.find(opt => opt.category === 'model' ||
@@ -648,11 +685,15 @@ impl ChatData {
             input_editor,
             input_height: cx.create_rw_signal(200.0),
             scroll_version: cx.create_rw_signal(0),
+            auto_scroll: cx.create_rw_signal(true),
             next_id: Rc::new(Cell::new(1)),
             scope: cx,
             pending_prompt: cx.create_rw_signal(None),
             session_requested: cx.create_rw_signal(false),
             terminals: Rc::new(std::cell::RefCell::new(HashMap::new())),
+            read_tool_ids: Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
             common,
         }
     }
@@ -803,6 +844,7 @@ impl ChatData {
         // Clear transcript + per-tool terminals; the load replay rebuilds them.
         self.blocks.set(Vec::new());
         self.terminals.borrow_mut().clear();
+        self.read_tool_ids.borrow_mut().clear();
         self.session_id.set(None);
         self.session_requested.set(false);
         self.config_options
@@ -1038,6 +1080,9 @@ impl ChatData {
         self.input_editor.doc().reload(Rope::from(""), true);
         self.input_editor.cursor().set(Cursor::origin(false));
         self.is_loading.set(true);
+        // Force auto-scroll back on when the user sends a prompt — they
+        // want to see the response.
+        self.auto_scroll.set(true);
 
         if let Some(session_id) = self.session_id.get_untracked() {
             self.common.proxy.notification(ProxyNotification::AcpPrompt {
@@ -1196,6 +1241,14 @@ impl ChatData {
                     &id, &title, &kind, status, raw_input, raw_output,
                 );
 
+                // Remember read tools by id. The announcement carries
+                // `kind:"read"`; the later completed update that delivers the
+                // file body omits it, so we record the classification here
+                // and consult it when content arrives (see tool_call_update).
+                if is_read_tool(Some(&kind), Some(&title)) {
+                    self.read_tool_ids.borrow_mut().insert(id.clone());
+                }
+
                 // edit/write tools can carry their `diff` block on the initial
                 // tool_call; attach it so we render a diff, not a plain call.
                 if let Some(diff) = extract_diff(&update) {
@@ -1253,7 +1306,20 @@ impl ChatData {
                 // them would attach a terminal and dump the whole file, so
                 // skip them here.
                 if let Some(text) = content_text {
-                    if !is_read_tool(kind, title) {
+                    // Muzzle read-tool bodies. The completed update carries the
+                    // file content in a `content` block but omits `kind`/`title`,
+                    // so we consult the id-memory seeded by the announcement
+                    // (see `read_content_decision`). Without this the body would
+                    // be fed into a terminal grid and dump the whole file.
+                    let (remember, muzzle) = read_content_decision(
+                        self.read_tool_ids.borrow().contains(&id),
+                        kind,
+                        title,
+                    );
+                    if remember {
+                        self.read_tool_ids.borrow_mut().insert(id.clone());
+                    }
+                    if !muzzle {
                         self.feed_tool_output_text(&id, &text);
                     }
                 }
@@ -1603,6 +1669,47 @@ mod tests {
         assert!(!is_read_tool(Some("edit"), Some("edit: foo.rs")));
         assert!(!is_read_tool(None, Some("write: foo.rs")));
         assert!(!is_read_tool(None, None));
+    }
+
+    /// Regression for the read-body leak. The real wire lifecycle (captured
+    /// from the ACP rolling log) is:
+    ///   1. `tool_call`        kind="read"  title="read: /path"  (no body)
+    ///   2. `tool_call_update` status=completed, NO kind/title, body in a
+    ///      `content` text block.
+    /// A per-event `is_read_tool` on event (2) sees (None, None) → false and
+    /// would feed the body. The client must instead remember the id from
+    /// event (1) and muzzle event (2).
+    #[test]
+    fn read_content_decision_muzzles_body_across_events() {
+        // Event 1: announcement — remember it, and it has no body anyway.
+        let (remember, muzzle) =
+            read_content_decision(false, Some("read"), Some("read: /x.md"));
+        assert!(remember, "announcement must seed the read memory");
+        assert!(muzzle);
+
+        // Event 2: completed body — kind/title are EMPTY on the wire, but the
+        // id was remembered, so the body is muzzled. This is the exact bug:
+        // the old code keyed on the empty per-event kind/title and leaked.
+        let (remember, muzzle) = read_content_decision(true, None, None);
+        assert!(!remember, "completed update carries no classification");
+        assert!(muzzle, "body must be muzzled via remembered id");
+
+        // A read whose announcement we somehow missed but the update names:
+        let (remember, muzzle) =
+            read_content_decision(false, Some("read"), None);
+        assert!(remember);
+        assert!(muzzle);
+
+        // A genuine non-read (execute) must still feed its output.
+        let (remember, muzzle) =
+            read_content_decision(false, Some("execute"), Some("execute"));
+        assert!(!remember);
+        assert!(!muzzle, "execute output must NOT be muzzled");
+
+        // Unknown tool, never remembered, no classification → feed.
+        let (remember, muzzle) = read_content_decision(false, None, None);
+        assert!(!remember);
+        assert!(!muzzle);
     }
 
     /// The exact shape crow-cli sends when an `execute` tool spawns a

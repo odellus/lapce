@@ -77,14 +77,21 @@ pub fn chat_view(
     let focus = window_tab_data.common.focus;
     let is_loading = chat.is_loading;
     let scroll_version = chat.scroll_version;
+    let auto_scroll = chat.auto_scroll;
 
     let scroll_target = create_rw_signal(None::<floem::kurbo::Point>);
+    // Track the furthest-down scroll position we've seen (approximates
+    // the content bottom from the last auto-scroll).
+    let max_scroll_y = create_rw_signal(0.0_f64);
 
     {
         let scroll_target = scroll_target;
+        let auto_scroll = auto_scroll;
         floem::reactive::create_effect(move |_| {
             let _v = scroll_version.get();
-            scroll_target.set(Some(floem::kurbo::Point::new(0.0, 1e9)));
+            if auto_scroll.get_untracked() {
+                scroll_target.set(Some(floem::kurbo::Point::new(0.0, 1e9)));
+            }
         });
     }
 
@@ -200,6 +207,20 @@ pub fn chat_view(
                 .style(|s| s.flex_col().width_pct(100.0).padding(16.0))
             })
             .scroll_to(move || scroll_target.get())
+            .on_scroll(move |rect| {
+                // Track whether the viewport is at the bottom.
+                // When the user scrolls up, y1 drops below the max we've
+                // seen (which approximates the content bottom from the
+                // last auto-scroll).  When they scroll back down to the
+                // bottom, y1 catches up again.
+                let y1 = rect.y1;
+                let prev = max_scroll_y.get_untracked();
+                if y1 > prev {
+                    max_scroll_y.set(y1);
+                }
+                let current_max = max_scroll_y.get_untracked();
+                auto_scroll.set(y1 >= current_max - 40.0);
+            })
             // Absorb the wheel even at the scroll extremes so the chat scroll
             // "takes control" instead of leaking to the outer workbench scroll
             // (mirrors crow-ade's wheel stopPropagation on its message list).
@@ -1226,7 +1247,7 @@ fn render_tool_call(
     new_text: Option<String>,
     config: floem::reactive::ReadSignal<std::sync::Arc<crate::config::LapceConfig>>,
     chat: ChatData,
-) -> impl View {
+) -> AnyView {
     let open = create_rw_signal(true);
     let status_icon = status.icon().to_string();
     let kind_label = kind.clone();
@@ -1238,6 +1259,11 @@ fn render_tool_call(
     let is_link = file_path.is_some();
     // Read tools render ONLY a clickable link — never dump the file body.
     let is_read = kind == "read" || title.to_lowercase().starts_with("read");
+
+    // Read tools keep the tool-fixture card (border + header with the
+    // clickable path link) but render NO body — the file content never
+    // dumps into the chat. The header itself opens the file on click.
+
     // Header text: the file path when we have one (rendered as a clickable
     // link), else the title with any read:/write:/edit: prefix stripped.
     let header_text = match &file_path {
@@ -1246,6 +1272,8 @@ fn render_tool_call(
     };
     let internal_command = chat.common.internal_command;
     let path_for_click = file_path.clone();
+    let path_for_header = file_path.clone();
+    let internal_command_header = chat.common.internal_command;
 
     let input_text = raw_input.unwrap_or_default();
     let output_text = raw_output.unwrap_or_default();
@@ -1330,6 +1358,8 @@ fn render_tool_call(
                     s.font_size(10.0)
                         .color(config.color(LapceColor::EDITOR_DIM))
                         .selectable(false)
+                        // Read tools have no body to collapse — hide the caret.
+                        .apply_if(is_read, |s| s.hide())
                 }),
             ))
             .style(move |s| {
@@ -1346,7 +1376,16 @@ fn render_tool_call(
                     })
             })
             .on_click_stop(move |_| {
-                open.update(|o| *o = !*o);
+                if is_read {
+                    // Read fixture has no body — the whole header opens the file.
+                    if let Some(p) = &path_for_header {
+                        internal_command_header.send(InternalCommand::OpenFile {
+                            path: PathBuf::from(p),
+                        });
+                    }
+                } else {
+                    open.update(|o| *o = !*o);
+                }
             }),
             // Content area
             if let Some(handle) = term_handle {
@@ -1424,6 +1463,7 @@ fn render_tool_call(
             .border_color(config.color(LapceColor::LAPCE_BORDER))
             .background(config.color(LapceColor::EDITOR_BACKGROUND))
     })
+    .into_any()
 }
 
 /// Render an inline diff for an edit/write tool call. `old_text` None ⇒ a
