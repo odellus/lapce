@@ -224,10 +224,18 @@ impl AcpSession {
     }
 
     /// Send `session/load` for an existing session.
-    pub fn load_session(&self, target_session_id: &str, cwd: &str) -> Result<Value> {
+    pub fn load_session(
+        &self,
+        target_session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<Value>,
+    ) -> Result<Value> {
+        // `mcpServers` is required by the agent on load just as on new; an
+        // empty vec serialises to `[]`.
         let params = json!({
             "sessionId": target_session_id,
             "cwd": cwd,
+            "mcpServers": mcp_servers,
         });
         let resp = self.request("session/load", params)?;
         *self.session_id.lock().unwrap() = Some(target_session_id.to_string());
@@ -944,7 +952,7 @@ impl AcpSessionManager {
                     session.connection_id,
                     target
                 );
-                session.load_session(&target, cwd)?;
+                session.load_session(&target, cwd, mcp_servers)?;
             }
             None => {
                 acp_log!("INFO", "connection={} sending session/new", session.connection_id);
