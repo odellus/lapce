@@ -6,16 +6,16 @@ use floem::{
     AnyView, IntoView, View,
     event::{Event, EventListener, EventPropagation},
     peniko::Color,
-    peniko::kurbo::Point,
+    peniko::kurbo::{Point, Rect},
     reactive::{
-        RwSignal, SignalGet, SignalUpdate, SignalWith, create_memo,
+        RwSignal, SignalGet, SignalTrack, SignalUpdate, SignalWith, create_memo,
         create_rw_signal,
     },
     style::CursorStyle,
     text::Style as FontStyle,
     views::{
         Decorators, container, dyn_stack,
-        editor::{WrapProp, text::WrapMethod},
+        editor::{WrapProp, text::WrapMethod, view::{LineRegion, cursor_caret}},
         empty, label, rich_text, scroll, stack,
     },
 };
@@ -456,7 +456,7 @@ pub fn chat_view(
                 });
             stack((
                 drag_handle,
-                container(
+                container({
                     // Reference pattern (editor/view.rs: normal editor): a
                     // `scroll` gives the editor a *definite* viewport from the
                     // parent chain; `absolute()` + `min_size_full()` take the
@@ -464,6 +464,12 @@ pub fn chat_view(
                     // never sizes to its own (growing) content. With
                     // `WrapMethod::EditorWidth` the text then wraps to the box
                     // instead of pushing the chat panel wider.
+                    //
+                    // `ensure_visible` keeps the cursor in view as the user
+                    // types — without it the scroll never follows the caret
+                    // when the text grows beyond the input box.
+                    let input_cursor = input_editor.cursor();
+                    let input_editor_for_vis = input_editor.clone();
                     scroll(
                         editor_view(input_editor, debug_breakline, is_active)
                             .style(move |s| {
@@ -473,9 +479,31 @@ pub fn chat_view(
                                     .set(WrapProp, WrapMethod::EditorWidth)
                             }),
                     )
+                    .ensure_visible(move || {
+                        let cursor = input_cursor.get();
+                        let offset = cursor.offset();
+                        input_editor_for_vis.doc_signal().track();
+                        input_editor_for_vis.kind.track();
+
+                        let LineRegion { x, width, rvline } = cursor_caret(
+                            &input_editor_for_vis.editor,
+                            offset,
+                            !cursor.is_insert(),
+                            cursor.affinity,
+                        );
+                        let cfg = config.get_untracked();
+                        let line_height = cfg.editor.line_height();
+                        let vline = input_editor_for_vis.editor.vline_of_rvline(rvline);
+                        let vline = input_editor_for_vis.visual_line(vline.get());
+                        Rect::from_origin_size(
+                            (x, (vline * line_height) as f64),
+                            (width, line_height as f64),
+                        )
+                        .inflate(10.0, 10.0)
+                    })
                     .scroll_style(|s| s.hide_bars(true))
-                    .style(|s| s.size_pct(100.0, 100.0)),
-                )
+                    .style(|s| s.size_pct(100.0, 100.0))
+                })
                     .style(move |s| {
                         let config = config.get();
                         s.width_pct(100.0)
